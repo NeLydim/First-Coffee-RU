@@ -1,9 +1,3 @@
-"""Минимальные заглушки SDK exteraGram и Chaquopy для офлайн-тестов плагина.
-
-Настоящие Java-классы недоступны вне Android, поэтому здесь — простые
-Python-подделки, достаточные, чтобы проверить логику импорта, разбора
-шрифтов, ролей начертаний и хуков.
-"""
 import importlib.machinery
 import importlib.util
 import os
@@ -14,7 +8,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_PATH = os.path.join(ROOT, "NelyFonts.plugin")
 
 
-# ---- android.graphics.Typeface и друзья -----------------------------------
 class FakeTypeface:
     def __init__(self, src, weight=400, italic=False, synth=None, variation=None):
         self.src = src
@@ -109,8 +102,6 @@ class FakeOutputStream:
 
 
 class FakeInputStream:
-    """InputStream.read(byte[]) — заполняет переданный буфер на месте."""
-
     def __init__(self, data, chunk=7000):
         self.data = data
         self.pos = 0
@@ -161,7 +152,6 @@ class FakeClass:
         raise Exception("ClassNotFoundException")
 
 
-# ---- SDK exteraGram --------------------------------------------------------
 class BasePlugin:
     def __init__(self):
         self.settings = {}
@@ -247,7 +237,6 @@ def load_plugin_module():
     return module
 
 
-# ---- Подделка AndroidUtilities (кеш шрифтов Telegram) и дерева вью ----------
 class FakeMap(dict):
     def put(self, k, v):
         self[k] = v
@@ -284,7 +273,6 @@ class FakeMap(dict):
 
 
 class FakeAU:
-    """AndroidUtilities: getTypeface() читает кеш (как встроенный ART-ом код — без хуков)."""
     typefaceCache = FakeMap()
     mediumTypeface = None
 
@@ -330,8 +318,6 @@ class FakeField:
 
 
 class FakeAUClass:
-    """java.lang.Class для AndroidUtilities (для reflection-доступа к полям)."""
-
     def getDeclaredField(self, name):
         if not hasattr(FakeAU, name):
             raise Exception("NoSuchFieldException: " + name)
@@ -376,10 +362,10 @@ class FakeLaunchActivity:
     rebuilds = 0
 
     def __init__(self, root):
-        self.root = root
+        self.folder = root
 
     def getWindow(self):
-        return types.SimpleNamespace(getDecorView=lambda: self.root)
+        return types.SimpleNamespace(getDecorView=lambda: self.folder)
 
     def rebuildAllFragments(self, _last):
         FakeLaunchActivity.rebuilds += 1
