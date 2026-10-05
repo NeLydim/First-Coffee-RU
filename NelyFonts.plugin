@@ -1,0 +1,2630 @@
+__id__ = "nelyfonts"
+__name__ = "NelyFonts"
+__description__ = "Глобальная замена шрифта в exteraGram и AyuGram. Импорт TTF/OTF/TTC и ZIP-архивов из файлов, загрузок Telegram или по ссылке, целые семейства начертаний, вариативные шрифты, горячая смена без перезапуска и диагностика покрытия."
+__author__ = "@NeLydim"
+__version__ = "3.0.0"
+__min_version__ = "12.1.1"
+__app_version__ = ">=12.1.1"
+__icon__ = "LostChocolateFlamingo_by_fStikBot/51"
+
+import json
+import os
+import re
+import shutil
+import struct
+import sys
+import threading
+import time
+import traceback
+import zipfile
+from collections import deque
+from urllib.parse import unquote, urlparse
+
+from base_plugin import BasePlugin, MethodHook
+from android_utils import run_on_ui_thread
+from java import jclass, jarray, jbyte, dynamic_proxy
+from java.lang import Class
+from org.telegram.messenger import ApplicationLoader
+
+try:
+    from ui.settings import Header, Divider, Text, Input, Switch
+except Exception:  # pragma: no cover - SDK import guard
+    Header = Divider = Text = Input = Switch = None
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:  # pragma: no cover
+    BulletinHelper = None
+
+try:
+    from client_utils import get_last_fragment
+except Exception:  # pragma: no cover
+    get_last_fragment = None
+
+try:
+    from android_utils import copy_to_clipboard
+except Exception:  # pragma: no cover
+    copy_to_clipboard = None
+
+
+# ----------------------------------------------------------------------------
+# Константы
+# ----------------------------------------------------------------------------
+DATA_DIR = "nelyfonts"
+TMP_DIR = "nelyfonts_tmp"
+LEGACY_FONT = ("plugins", "mnd_global_font", "global_font.ttf")
+OWNER_ATTR = "_nelyfonts_owner"
+# Коды запроса выбора файла: REQ_BASE — «весь шрифт», REQ_BASE+1.. — отдельное начертание.
+REQ_BASE = 0x4E40
+MAX_FONT_BYTES = 64 * 1024 * 1024
+PRESET_NAME = "First Coffee RU"
+PRESET_URL = "https://raw.githubusercontent.com/NeLydim/First-Coffee-RU/main/First_Coffee_RU.ttf"
+
+NORMAL, BOLD, ITALIC, BOLD_ITALIC = 0, 1, 2, 3
+
+ROLES = ("regular", "medium", "bold", "italic", "medium_italic", "bold_italic")
+ROLE_WEIGHT = {"regular": 400, "medium": 500, "bold": 700,
+               "italic": 400, "medium_italic": 500, "bold_italic": 700}
+ROLE_ITALIC = {r: r.endswith("italic") for r in ROLES}
+ROLE_SHORT = {"regular": "обычный", "medium": "средний", "bold": "жирный", "italic": "курсив",
+              "medium_italic": "средний курсив", "bold_italic": "жирный курсив"}
+ROLE_TITLES = {
+    "regular": "Обычный",
+    "medium": "Средний (Medium)",
+    "bold": "Жирный",
+    "italic": "Курсив",
+    "medium_italic": "Средний курсив",
+    "bold_italic": "Жирный курсив",
+}
+# Штатные asset-шрифты Telegram для каждой роли (для возврата оригиналов).
+ROLE_ASSET = {
+    "regular": "fonts/rregular.ttf",
+    "medium": "fonts/rmedium.ttf",
+    "bold": "fonts/rmedium.ttf",
+    "italic": "fonts/ritalic.ttf",
+    "medium_italic": "fonts/rmediumitalic.ttf",
+    "bold_italic": "fonts/rmediumitalic.ttf",
+}
+FONT_EXTS = (".ttf", ".otf", ".ttc", ".otc")
+SFNT_TAGS = (b"\x00\x01\x00\x00", b"OTTO", b"true")
+
+AU_CLASS = "org.telegram.messenger.AndroidUtilities"
+FONT_UTILS_CLASS = "com.exteragram.messenger.utils.ui.FontUtils"
+TF_CLASS = "android.graphics.Typeface"
+
+
+class ImportFailure(Exception):
+    """Ошибка импорта с понятным пользователю текстом."""
+
+
+class FontParseError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------------
+# Чистые функции (без Java) — разбор шрифтов, классификация, ссылки
+# ----------------------------------------------------------------------------
+def _u16(data, off):
+    return struct.unpack_from(">H", data, off)[0]
+
+
+def _u32(data, off):
+    return struct.unpack_from(">I", data, off)[0]
+
+
+def _fixed(data, off):
+    return struct.unpack_from(">i", data, off)[0] / 65536.0
+
+
+def sniff_kind(head):
+    """Определить тип файла по первым байтам."""
+    head = bytes(head[:8])
+    if head[:4] in SFNT_TAGS or head[:4] == b"ttcf":
+        return "font"
+    if head[:4] in (b"wOFF", b"wOF2"):
+        return "woff"
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+        return "zip"
+    stripped = head.lstrip()
+    if stripped[:1] == b"<" or stripped[:1] == b"{":
+        return "html"
+    return "unknown"
+
+
+def _parse_names(data, off):
+    count = _u16(data, off + 2)
+    strings = off + _u16(data, off + 4)
+    best = {}
+    for i in range(count):
+        rec = off + 6 + 12 * i
+        pid, eid, lid, nid, ln, so = struct.unpack_from(">HHHHHH", data, rec)
+        if nid not in (1, 2, 4, 16, 17):
+            continue
+        raw = data[strings + so:strings + so + ln]
+        if pid in (0, 3):
+            text = raw.decode("utf-16-be", "replace")
+            rank = 0 if (pid == 3 and lid == 0x409) else (1 if pid == 3 else 3)
+        elif pid == 1 and eid == 0:
+            text = raw.decode("mac_roman", "replace")
+            rank = 2
+        else:
+            continue
+        text = text.strip("\x00 ").strip()
+        if text and (nid not in best or rank < best[nid][0]):
+            best[nid] = (rank, text)
+    return {k: v[1] for k, v in best.items()}
+
+
+def _cmap_lookup(data, off):
+    num = _u16(data, off + 2)
+    ranks = {(3, 10, 12): 0, (0, 4, 12): 1, (0, 6, 12): 1, (3, 1, 4): 2,
+             (0, 3, 4): 3, (0, 4, 4): 3, (0, 1, 4): 4, (0, 0, 4): 4}
+    best = None
+    best_rank = 99
+    for i in range(num):
+        rec = off + 4 + 8 * i
+        if rec + 8 > len(data):
+            break
+        pid, eid = _u16(data, rec), _u16(data, rec + 2)
+        sub = off + _u32(data, rec + 4)
+        if sub + 4 > len(data):
+            continue
+        fmt = _u16(data, sub)
+        rank = ranks.get((pid, eid, fmt))
+        if rank is None:
+            if fmt in (4, 12) and pid in (0, 3):
+                rank = 5
+            else:
+                continue
+        if rank < best_rank:
+            best_rank, best = rank, (fmt, sub)
+    if best is None:
+        return lambda cp: 0
+    fmt, sub = best
+    if fmt == 12:
+        n = min(_u32(data, sub + 12), (len(data) - sub - 16) // 12)
+        groups = [struct.unpack_from(">III", data, sub + 16 + 12 * g) for g in range(n)]
+
+        def look12(cp):
+            for start, end, gid in groups:
+                if start <= cp <= end:
+                    return gid + (cp - start)
+            return 0
+        return look12
+
+    seg_x2 = _u16(data, sub + 6)
+    seg = seg_x2 // 2
+    ends = sub + 14
+    starts = ends + seg_x2 + 2
+    deltas = starts + seg_x2
+    ranges = deltas + seg_x2
+
+    def look4(cp):
+        if cp > 0xFFFF:
+            return 0
+        for i in range(seg):
+            if cp > _u16(data, ends + 2 * i):
+                continue
+            start = _u16(data, starts + 2 * i)
+            if cp < start:
+                return 0
+            delta = _u16(data, deltas + 2 * i)
+            ro = _u16(data, ranges + 2 * i)
+            if ro == 0:
+                return (cp + delta) & 0xFFFF
+            addr = ranges + 2 * i + ro + 2 * (cp - start)
+            if addr + 2 > len(data):
+                return 0
+            g = _u16(data, addr)
+            return (g + delta) & 0xFFFF if g else 0
+        return 0
+    return look4
+
+
+def guess_style_from_name(name):
+    """(weight, italic) по имени файла — запасной вариант, если в шрифте нет OS/2."""
+    base = os.path.splitext(os.path.basename(name or ""))[0].lower()
+    flat = re.sub(r"[\s_\-.]+", "", base)
+    italic = "italic" in flat or "oblique" in flat
+    words = (("extralight", 200), ("ultralight", 200), ("semibold", 600), ("demibold", 600),
+             ("extrabold", 800), ("ultrabold", 800), ("hairline", 100), ("thin", 100),
+             ("light", 300), ("medium", 500), ("regular", 400), ("normal", 400), ("book", 400),
+             ("bold", 700), ("black", 900), ("heavy", 900))
+    for word, weight in words:
+        if word in flat:
+            return weight, italic
+    return 400, italic
+
+
+def _snap_weight(w):
+    if 0 < w < 10:
+        w *= 100
+    if w <= 0:
+        return 400
+    return max(100, min(900, int(round(w / 100.0)) * 100))
+
+
+def parse_font(data, name="", index=0):
+    """Разобрать SFNT (TTF/OTF/TTC) и вернуть сведения о шрифте.
+
+    Бросает FontParseError, если файл не является корректным шрифтом —
+    это ловит «битые» и недокачанные файлы ещё до передачи в Android.
+    """
+    data = bytes(data)
+    if len(data) < 12:
+        raise FontParseError("файл слишком маленький")
+    base = 0
+    collection = data[:4] == b"ttcf"
+    if collection:
+        num = _u32(data, 8)
+        if num == 0 or 12 + 4 * num > len(data):
+            raise FontParseError("повреждённая коллекция шрифтов")
+        base = _u32(data, 12 + 4 * (index if index < num else 0))
+    if data[base:base + 4] not in SFNT_TAGS:
+        raise FontParseError("неизвестный формат шрифта")
+    num_tables = _u16(data, base + 4)
+    if not 1 <= num_tables <= 512:
+        raise FontParseError("повреждённый заголовок шрифта")
+    tables = {}
+    for i in range(num_tables):
+        rec = base + 12 + 16 * i
+        if rec + 16 > len(data):
+            raise FontParseError("файл обрезан — скачайте его заново")
+        tag = data[rec:rec + 4].decode("latin-1")
+        off, ln = _u32(data, rec + 8), _u32(data, rec + 12)
+        if off + ln > len(data):
+            raise FontParseError("таблица «%s» выходит за конец файла — файл повреждён или скачан не полностью" % tag.strip())
+        tables[tag] = (off, ln)
+    if "cmap" not in tables:
+        raise FontParseError("в шрифте нет таблицы символов (cmap)")
+    if not any(t in tables for t in ("glyf", "CFF ", "CFF2")):
+        raise FontParseError("в шрифте нет контуров глифов")
+
+    info = {
+        "format": "OpenType (CFF)" if data[base:base + 4] == b"OTTO" else "TrueType",
+        "collection": collection,
+        "size": len(data),
+        "family": "", "subfamily": "", "full_name": "",
+        "weight": 0, "italic": False, "variable": False, "axes": {},
+        "glyphs": 0, "latin": False, "cyrillic": False, "digits": False,
+    }
+    if collection:
+        info["format"] += ", коллекция"
+    try:
+        if "name" in tables:
+            names = _parse_names(data, tables["name"][0])
+            info["family"] = names.get(16) or names.get(1) or ""
+            info["subfamily"] = names.get(17) or names.get(2) or ""
+            info["full_name"] = names.get(4) or ""
+    except Exception:
+        pass
+    weight = 0
+    italic = None
+    try:
+        if "OS/2" in tables and tables["OS/2"][1] >= 64:
+            o = tables["OS/2"][0]
+            weight = _u16(data, o + 4)
+            italic = bool(_u16(data, o + 62) & 0x01)
+    except Exception:
+        pass
+    try:
+        if italic is None and "head" in tables:
+            italic = bool(_u16(data, tables["head"][0] + 44) & 0x02)
+    except Exception:
+        pass
+    g_weight, g_italic = guess_style_from_name(info["subfamily"] or name)
+    info["weight"] = _snap_weight(weight) if weight else g_weight
+    info["italic"] = bool(italic) if italic is not None else g_italic
+    try:
+        if "maxp" in tables:
+            info["glyphs"] = _u16(data, tables["maxp"][0] + 4)
+    except Exception:
+        pass
+    try:
+        if "fvar" in tables:
+            o = tables["fvar"][0]
+            axes_off, count, size = _u16(data, o + 4), _u16(data, o + 8), _u16(data, o + 10)
+            axes = {}
+            for i in range(count):
+                a = o + axes_off + size * i
+                tag = data[a:a + 4].decode("latin-1")
+                axes[tag] = [_fixed(data, a + 4), _fixed(data, a + 8), _fixed(data, a + 12)]
+            info["variable"] = bool(axes)
+            info["axes"] = axes
+    except Exception:
+        pass
+    try:
+        look = _cmap_lookup(data, tables["cmap"][0])
+        info["latin"] = all(look(ord(c)) for c in "AZaz")
+        info["cyrillic"] = all(look(cp) for cp in (0x0410, 0x042F, 0x0430, 0x044F, 0x0401, 0x0451))
+        info["digits"] = all(look(ord(c)) for c in "0123456789")
+    except Exception:
+        pass
+    if not info["family"]:
+        info["family"] = os.path.splitext(os.path.basename(name or "font"))[0]
+    return info
+
+
+def _role_from_parts(weight_kind, italic):
+    if weight_kind == "regular":
+        return "italic" if italic else "regular"
+    return weight_kind + ("_italic" if italic else "")
+
+
+def classify_asset(path):
+    """Сырая роль для asset-ключа Telegram (fonts/rmedium.ttf и т.п.).
+
+    Возвращает одну из ROLES, «mono», «serif_<роль>», «special» (эмодзи,
+    цифровые и декоративные шрифты — никогда не подменяются) или None.
+    """
+    p = str(path or "").lower()
+    if not p:
+        return None
+    base = p.rsplit("/", 1)[-1]
+    if "emoji" in p or base.startswith(("num.", "impact")):
+        return "special"
+    if "mono" in p or "courier" in p:
+        return "mono"
+    italic = "italic" in p or "oblique" in p
+    if "medium" in p:
+        kind = "medium"
+    elif any(k in p for k in ("bold", "black", "heavy")):
+        kind = "bold"
+    else:
+        kind = "regular"
+    role = _role_from_parts(kind, italic)
+    if base.startswith("mw_") or "merriweather" in p or ("serif" in p and "sans" not in p):
+        return "serif_" + role
+    return role
+
+
+def classify_family(name):
+    """Семейство для Typeface.create(String, int): sans / sans-medium / mono / serif / None."""
+    n = str(name or "").strip().lower()
+    if not n or n in ("default", "system-ui", "arial", "helvetica"):
+        return "sans"
+    if "mono" in n or n.startswith("courier"):
+        return "mono"
+    if n.startswith(("sans-serif", "roboto", "google-sans", "sans")):
+        if "medium" in n or "semibold" in n:
+            return "sans-medium"
+        if "black" in n or "bold" in n:
+            return "sans-bold"
+        return "sans"
+    if n.startswith("serif") or ("serif" in n and "sans" not in n):
+        return "serif"
+    return None
+
+
+def role_for_style(style):
+    return ("regular", "bold", "italic", "bold_italic")[int(style) & 0x03]
+
+
+def role_for_weight(weight, italic):
+    weight = int(weight)
+    kind = "bold" if weight >= 600 else ("medium" if weight >= 450 else "regular")
+    return _role_from_parts(kind, bool(italic))
+
+
+def family_role(family_kind, style):
+    style = int(style) & 0x03
+    if family_kind == "mono":
+        return "mono"
+    if family_kind == "serif":
+        return "serif_" + role_for_style(style)
+    if family_kind == "sans-medium" and not style & BOLD:
+        return "medium_italic" if style & ITALIC else "medium"
+    if family_kind == "sans-bold":
+        return "bold_italic" if style & ITALIC else "bold"
+    return role_for_style(style)
+
+
+def restyle(raw, style):
+    """Роль для Typeface.create(<гарнитура с ролью raw>, style).
+
+    Как в Android 9+: BOLD добавляет вес к весу исходной гарнитуры, а курсив
+    задаётся только style (create(bold, ITALIC) -> жирный курсив).
+    """
+    style = int(style) & 0x03
+    if raw in ("mono", "special"):
+        return raw
+    prefix = ""
+    if raw.startswith("serif_"):
+        prefix, raw = "serif_", raw[6:]
+    kind = raw.replace("_italic", "")
+    if kind == "italic":
+        kind = "regular"
+    if style & BOLD:
+        kind = "bold"
+    return prefix + _role_from_parts(kind, bool(style & ITALIC))
+
+
+def _name_score(name):
+    n = name.lower()
+    m = re.search(r"(\d+)pt", n)
+    return (int(m.group(1)) if m else 0, "variable" in n, len(n), n)
+
+
+def assign_family(cands):
+    """Разложить найденные файлы по начертаниям (по данным OS/2, затем по имени).
+
+    cands: список dict(name=..., info=...). Возвращает {роль: cand}.
+    """
+    statics = [c for c in cands if not c["info"].get("variable")]
+    variables = [c for c in cands if c["info"].get("variable")]
+    used = set()
+
+    def pick(pool, italic, weights):
+        for w in weights:
+            m = [c for c in pool if bool(c["info"].get("italic")) == italic
+                 and c["info"].get("weight") == w and id(c) not in used]
+            if m:
+                c = min(m, key=lambda x: _name_score(x["name"]))
+                used.add(id(c))
+                return c
+        return None
+
+    slots = {}
+    regular = pick(statics, False, (400, 300, 500))
+    if regular is None:
+        if variables:
+            upright = [c for c in variables if not c["info"].get("italic")] or variables
+            slots["regular"] = min(upright, key=lambda x: _name_score(x["name"]))
+            italics = [c for c in variables if c["info"].get("italic")]
+            if italics:
+                slots["italic"] = min(italics, key=lambda x: _name_score(x["name"]))
+            return slots
+        pool = [c for c in statics if not c["info"].get("italic")] or statics or cands
+        slots["regular"] = min(pool, key=lambda c: (abs(c["info"].get("weight", 400) - 400), _name_score(c["name"])))
+        return slots
+    slots["regular"] = regular
+    for role, italic, weights in (("bold", False, (700, 800, 600)),
+                                  ("medium", False, (500, 600)),
+                                  ("italic", True, (400, 300)),
+                                  ("bold_italic", True, (700, 800, 600)),
+                                  ("medium_italic", True, (500, 600))):
+        c = pick(statics, italic, weights)
+        if c is not None:
+            slots[role] = c
+    return slots
+
+
+def normalize_source(text):
+    """Строка из поля «ссылка» → (kind, value): url / path / uri."""
+    s = str(text or "").strip().strip("\"'").strip()
+    if not s:
+        return None, None
+    if s.startswith("content://"):
+        return "uri", s
+    if s.startswith("file://"):
+        return "path", unquote(s[7:])
+    if s.startswith("/"):
+        return "path", s
+    if not re.match(r"^https?://", s, re.I):
+        s = "https://" + s
+    m = re.match(r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/(?:blob|raw)/([^?#]+)", s, re.I)
+    if m:
+        return "url", "https://raw.githubusercontent.com/%s/%s/%s" % m.groups()
+    m = re.match(r"^https?://drive\.google\.com/file/d/([^/?#]+)", s, re.I)
+    if m:
+        return "url", "https://drive.google.com/uc?export=download&id=" + m.group(1)
+    if re.match(r"^https?://(?:www\.)?dropbox\.com/", s, re.I):
+        s = re.sub(r"([?&])dl=0", r"\1dl=1", s)
+        if "dl=1" not in s:
+            s += ("&" if "?" in s else "?") + "dl=1"
+    return "url", s
+
+
+def name_from_url(url):
+    try:
+        path = urlparse(url).path
+        name = unquote(path.rsplit("/", 1)[-1])
+        return name or "font"
+    except Exception:
+        return "font"
+
+
+def safe_name(name):
+    name = os.path.basename(str(name or "font"))
+    name = re.sub(r"[^\w.\-() ]+", "_", name, flags=re.UNICODE).strip() or "font"
+    return name[:96]
+
+
+def fmt_size(n):
+    n = int(n or 0)
+    if n >= 1024 * 1024:
+        return "%.1f МБ" % (n / 1048576.0)
+    if n >= 1024:
+        return "%d КБ" % round(n / 1024.0)
+    return "%d Б" % n
+
+
+def _clamp_axis(value, axis):
+    lo, _default, hi = axis
+    return max(lo, min(hi, value))
+
+
+def _to_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(x.intValue())
+        except Exception:
+            return default
+
+
+# ----------------------------------------------------------------------------
+# Java-утилиты
+# ----------------------------------------------------------------------------
+_tls = threading.local()
+
+
+def _guarded():
+    return getattr(_tls, "depth", 0) > 0
+
+
+class _Guard:
+    """Пока активен — наши собственные хуки на этом потоке ничего не делают.
+
+    Нужен, когда мы САМИ вызываем Typeface.create(...) и т.п. Счётчик, а не флаг:
+    вложенные блоки не сбрасывают внешний.
+    """
+
+    def __enter__(self):
+        _tls.depth = getattr(_tls, "depth", 0) + 1
+        return self
+
+    def __exit__(self, *exc):
+        _tls.depth = max(0, getattr(_tls, "depth", 1) - 1)
+        return False
+
+
+class J:
+    """Получение настоящих java.lang.Class.
+
+    find_class() в реальном exteraGram возвращает Chaquopy-прокси, у которого нет
+    getDeclaredMethod/getDeclaredFields, — поэтому старая версия молча не ставила
+    ни одного хука. Class.forName с загрузчиком приложения работает всегда.
+    """
+    _cache = {}
+    PRIMITIVES = {"int": "java.lang.Integer", "float": "java.lang.Float",
+                  "boolean": "java.lang.Boolean", "long": "java.lang.Long"}
+
+    @classmethod
+    def cls(cls, name):
+        if name in cls._cache:
+            return cls._cache[name]
+        c = None
+        if name in cls.PRIMITIVES:
+            try:
+                c = jclass(cls.PRIMITIVES[name]).TYPE
+            except Exception:
+                c = None
+        else:
+            try:
+                loader = ApplicationLoader.applicationContext.getClassLoader()
+                c = Class.forName(name, False, loader)
+            except Exception:
+                try:
+                    c = Class.forName(name)
+                except Exception:
+                    c = None
+        cls._cache[name] = c
+        return c
+
+    @staticmethod
+    def proxy(name):
+        try:
+            return jclass(name)
+        except Exception:
+            if "$" in name:
+                outer, inner = name.split("$", 1)
+                try:
+                    obj = jclass(outer)
+                    for part in inner.split("$"):
+                        obj = getattr(obj, part)
+                    return obj
+                except Exception:
+                    return None
+            return None
+
+
+_SDK = [None]
+
+
+def sdk_int():
+    if _SDK[0] is None:
+        try:
+            _SDK[0] = int(jclass("android.os.Build$VERSION").SDK_INT)
+        except Exception:
+            try:
+                from android.os import Build
+                _SDK[0] = int(Build.VERSION.SDK_INT)
+            except Exception:
+                _SDK[0] = 0
+    return _SDK[0]
+
+
+def _app_context():
+    try:
+        return ApplicationLoader.applicationContext
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------------
+# FontSet — неизменяемый набор готовых Typeface для всех ролей.
+# Меняется одной атомарной заменой ссылки, поэтому хуки на любом потоке
+# всегда видят согласованное состояние.
+# ----------------------------------------------------------------------------
+class FontSet:
+    def __init__(self, roles, real, info):
+        self.roles = roles          # роль -> Typeface
+        self.real = set(real)       # роли, взятые из настоящих файлов/инстансов
+        self.info = info
+        self.lookup = {}            # Typeface -> роль
+        for role in reversed(ROLES):
+            tf = roles.get(role)
+            if tf is not None:
+                self.lookup[tf] = role
+
+
+def build_fontset(slots, medium_as_bold, info=None):
+    """slots: роль -> {"path": str, "info": dict}. Обязателен "regular"."""
+    if "regular" not in slots:
+        raise ImportFailure("Не выбран основной шрифт")
+    Tf = jclass(TF_CLASS)
+    File = jclass("java.io.File")
+    sdk = sdk_int()
+    builder_cls = J.proxy("android.graphics.Typeface$Builder") if sdk >= 26 else None
+
+    def load(path, weight, italic, variation=None):
+        tf = None
+        if builder_cls is not None:
+            b = builder_cls(File(path))
+            b.setWeight(int(weight))
+            b.setItalic(bool(italic))
+            if variation:
+                b.setFontVariationSettings(variation)
+            tf = b.build()
+        else:
+            tf = Tf.createFromFile(path)
+        if tf is None:
+            raise ImportFailure("Android не смог загрузить шрифт «%s»" % os.path.basename(path))
+        return tf
+
+    def wght(axes, w):
+        return "'wght' %g" % _clamp_axis(w, axes["wght"])
+
+    with _Guard():
+        real = {}
+        for role in ROLES:
+            slot = slots.get(role)
+            if not slot:
+                continue
+            axes = (slot.get("info") or {}).get("axes") or {}
+            var = wght(axes, ROLE_WEIGHT[role]) if "wght" in axes and builder_cls is not None else None
+            real[role] = load(slot["path"], ROLE_WEIGHT[role], ROLE_ITALIC[role], var)
+
+        reg = slots["regular"]
+        axes = (reg.get("info") or {}).get("axes") or {}
+        if builder_cls is not None and axes:
+            # Вариативный шрифт: настоящие веса и наклон из осей вместо синтеза.
+            if "wght" in axes:
+                for role in ("medium", "bold"):
+                    if role not in real:
+                        real[role] = load(reg["path"], ROLE_WEIGHT[role], False, wght(axes, ROLE_WEIGHT[role]))
+            slant = None
+            if "ital" in axes:
+                slant = "'ital' %g" % _clamp_axis(1, axes["ital"])
+            elif "slnt" in axes and axes["slnt"][0] < 0:
+                slant = "'slnt' %g" % max(axes["slnt"][0], -12)
+            if slant:
+                for role in ("italic", "medium_italic", "bold_italic"):
+                    if role in real:
+                        continue
+                    w = ROLE_WEIGHT[role]
+                    var = slant + (", " + wght(axes, w) if "wght" in axes else "")
+                    real[role] = load(reg["path"], w, True, var)
+
+        roles = dict(real)
+        regular = roles["regular"]
+
+        def synth(base, style):
+            try:
+                tf = Tf.create(base, style)
+                return tf if tf is not None else base
+            except Exception:
+                return base
+
+        if "bold" not in roles:
+            roles["bold"] = synth(regular, BOLD)
+        if "italic" not in roles:
+            roles["italic"] = synth(regular, ITALIC)
+        if "bold_italic" not in roles:
+            if "bold" in real:
+                roles["bold_italic"] = synth(real["bold"], ITALIC)
+            elif "italic" in real:
+                roles["bold_italic"] = synth(real["italic"], BOLD)
+            else:
+                roles["bold_italic"] = synth(regular, BOLD_ITALIC)
+        if "medium" not in roles:
+            roles["medium"] = roles["bold"] if medium_as_bold else regular
+        if "medium_italic" not in roles:
+            if "medium" in real:
+                roles["medium_italic"] = synth(real["medium"], ITALIC)
+            else:
+                roles["medium_italic"] = roles["bold_italic"] if medium_as_bold else roles["italic"]
+    return FontSet(roles, real.keys(), info or {})
+
+
+# ----------------------------------------------------------------------------
+# FontCore — классификация гарнитур и текущий FontSet.
+# ----------------------------------------------------------------------------
+def _shared_registry(name):
+    """Словарь, переживающий переустановку плагина (хранится в модуле sys).
+
+    Новая версия плагина узнаёт гарнитуры, созданные предыдущей, и корректно
+    заменяет/откатывает их в уже созданных Paint.
+    """
+    reg = getattr(sys, name, None)
+    if not isinstance(reg, dict):
+        reg = {}
+        setattr(sys, name, reg)
+    return reg
+
+
+class FontCore:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.fs = None
+        self.known = _shared_registry("_nelyfonts_known")   # оригинальная Typeface -> сырая роль
+        self.ours = _shared_registry("_nelyfonts_ours")     # любая Typeface плагина -> роль
+        self.keep_mono = True
+        self.keep_serif = False
+        self._asset_roles = {}
+
+    def set_fontset(self, fs):
+        if fs is not None:
+            for tf, role in fs.lookup.items():
+                self.ours[tf] = role
+        self.fs = fs
+
+    def is_ours(self, tf):
+        try:
+            return tf is not None and tf in self.ours
+        except Exception:
+            return False
+
+    def classify(self, tf):
+        if tf is None:
+            return "regular"
+        try:
+            role = self.ours.get(tf)
+            if role is None:
+                role = self.known.get(tf)
+            return role
+        except Exception:
+            return None
+
+    def effective(self, raw):
+        if not raw or raw == "special":
+            return None
+        if raw == "mono":
+            return None if self.keep_mono else "regular"
+        if raw.startswith("serif_"):
+            return None if self.keep_serif else raw[6:]
+        return raw if raw in ROLES else None
+
+    def asset_role(self, path):
+        key = str(path) if path is not None else ""
+        raw = self._asset_roles.get(key)
+        if raw is None:
+            raw = classify_asset(key) or ""
+            self._asset_roles[key] = raw
+        return self.effective(raw)
+
+    # -- оригинальные гарнитуры ----------------------------------------------
+    def capture_originals(self):
+        try:
+            Tf = jclass(TF_CLASS)
+            with _Guard():
+                pairs = [(Tf.DEFAULT, "regular"), (Tf.SANS_SERIF, "regular"),
+                         (Tf.DEFAULT_BOLD, "bold"), (Tf.MONOSPACE, "mono"),
+                         (Tf.SERIF, "serif_regular")]
+                for style in (NORMAL, BOLD, ITALIC, BOLD_ITALIC):
+                    role = role_for_style(style)
+                    pairs.append((Tf.defaultFromStyle(style), role))
+                    pairs.append((Tf.create("sans-serif", style), role))
+                pairs.append((Tf.create("sans-serif-medium", NORMAL), "medium"))
+            for tf, role in pairs:
+                if tf is not None and tf not in self.known:
+                    self.known[tf] = role
+        except Exception as e:
+            self.plugin.event("capture originals: %s" % e)
+
+    def snapshot_app_cache(self):
+        """Запомнить роли гарнитур из кеша Telegram (до его очистки)."""
+        n = 0
+        try:
+            au = J.cls(AU_CLASS)
+            if au is None:
+                return 0
+            cache = None
+            try:
+                f = au.getDeclaredField("typefaceCache")
+                f.setAccessible(True)
+                cache = f.get(None)
+            except Exception:
+                cache = None
+            if cache is not None:
+                it = cache.entrySet().iterator()
+                while it.hasNext():
+                    e = it.next()
+                    k, v = e.getKey(), e.getValue()
+                    raw = classify_asset(str(k)) if k is not None else None
+                    # «special» (эмодзи, цифры, Impact) не запоминаем: неизвестные гарнитуры и так не трогаются.
+                    if v is not None and raw and raw != "special" and v not in self.ours and v not in self.known:
+                        self.known[v] = raw
+                        n += 1
+            try:
+                med = jclass(AU_CLASS).mediumTypeface
+                if med is not None and med not in self.ours and med not in self.known:
+                    self.known[med] = "medium"
+                    n += 1
+            except Exception:
+                pass
+        except Exception as e:
+            self.plugin.event("snapshot cache: %s" % e)
+        return n
+
+    def original_for(self, role):
+        """Штатная гарнитура приложения для роли (хуки при этом не срабатывают)."""
+        try:
+            with _Guard():
+                tf = jclass(AU_CLASS).getTypeface(ROLE_ASSET.get(role, ROLE_ASSET["regular"]))
+            if tf is not None and tf not in self.known:
+                self.known[tf] = role
+            return tf
+        except Exception:
+            return None
+
+
+# ----------------------------------------------------------------------------
+# Хуки. Все «шрифтовые» хуки срабатывают только при создании гарнитур/вью —
+# ни одного хука на draw/Canvas, никакой работы на кадр.
+# ----------------------------------------------------------------------------
+class _FontHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.core = plugin.core
+
+    def _fs(self):
+        if _guarded() or not self.plugin.is_current():
+            return None
+        return self.core.fs
+
+
+class _ProviderHook(_FontHook):
+    """AndroidUtilities.getTypeface / FontUtils.*(String assetPath) — отдаём свой вариант."""
+
+    def before_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            role = self.core.asset_role(param.args[0])
+            if role:
+                param.setResult(fs.roles[role])
+        except Exception:
+            pass
+
+
+class _CreateByNameHook(_FontHook):
+    """Typeface.create(String family, int style)."""
+
+    def before_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            kind = classify_family(param.args[0])
+            if kind is None:
+                return  # cursive/casual/emoji и прочие особые семейства не трогаем
+            role = self.core.effective(family_role(kind, _to_int(param.args[1])))
+            if role:
+                param.setResult(fs.roles[role])
+        except Exception:
+            pass
+
+
+class _CreateByFamilyHook(_FontHook):
+    """Typeface.create(Typeface family, int style)."""
+
+    def before_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            raw = self.core.classify(param.args[0])
+            if raw is None:
+                return  # кастомная гарнитура (эмодзи, иконки, редактор) — не трогаем
+            role = self.core.effective(restyle(raw, _to_int(param.args[1])))
+            if role:
+                param.setResult(fs.roles[role])
+        except Exception:
+            pass
+
+
+class _CreateWeightHook(_FontHook):
+    """Typeface.create(Typeface family, int weight, boolean italic) — API 28+."""
+
+    def before_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            raw = self.core.classify(param.args[0])
+            if raw is None:
+                return
+            weight, italic = _to_int(param.args[1], 400), bool(param.args[2])
+            if raw == "special":
+                return
+            if raw == "mono":
+                role = self.core.effective("mono")
+            elif raw.startswith("serif_"):
+                role = self.core.effective("serif_" + role_for_weight(weight, italic))
+            else:
+                role = role_for_weight(weight, italic)
+            if role:
+                param.setResult(fs.roles[role])
+        except Exception:
+            pass
+
+
+class _DefaultFromStyleHook(_FontHook):
+    def before_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            param.setResult(fs.roles[role_for_style(_to_int(param.args[0]))])
+        except Exception:
+            pass
+
+
+def _replacement(core, fs, current):
+    role = core.effective(core.classify(current))
+    if not role:
+        return None
+    new = fs.roles.get(role)
+    if new is None:
+        return None
+    try:
+        if current is not None and current.equals(new):
+            return None
+    except Exception:
+        pass
+    return new
+
+
+class _TextViewCtorHook(_FontHook):
+    """После конструктора TextView: системная/пустая гарнитура -> наша."""
+
+    def after_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            view = param.thisObject
+            new = _replacement(self.core, fs, view.getTypeface())
+            if new is not None:
+                view.setTypeface(new)
+        except Exception:
+            pass
+
+
+class _PaintOwnerCtorHook(_FontHook):
+    """Компоненты Telegram с собственным TextPaint (AnimatedTextDrawable)."""
+
+    def after_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            obj = param.thisObject
+            new = _replacement(self.core, fs, obj.getPaint().getTypeface())
+            if new is not None:
+                obj.setTypeface(new)
+        except Exception:
+            pass
+
+
+class _TypefaceArgHook(_FontHook):
+    """Конструктор с Typeface-аргументом (Components.Text): подмена ДО тела."""
+
+    def __init__(self, plugin, index):
+        super().__init__(plugin)
+        self.index = index
+
+    def before_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            new = _replacement(self.core, fs, param.args[self.index])
+            if new is not None:
+                param.args[self.index] = new
+        except Exception:
+            pass
+
+
+class _TextPaintCtorHook(_FontHook):
+    """Глубокий режим: любой новый TextPaint без гарнитуры получает наш шрифт."""
+
+    def after_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            paint = param.thisObject
+            if paint.getTypeface() is None:
+                paint.setTypeface(fs.roles["regular"])
+        except Exception:
+            pass
+
+
+def _collect_uris(data):
+    uris = []
+    if data is None:
+        return uris
+    try:
+        clip = data.getClipData()
+        if clip is not None:
+            for i in range(clip.getItemCount()):
+                u = clip.getItemAt(i).getUri()
+                if u is not None:
+                    uris.append(u)
+    except Exception:
+        pass
+    if not uris:
+        try:
+            u = data.getData()
+            if u is not None:
+                uris.append(u)
+        except Exception:
+            pass
+    return uris
+
+
+class _ActivityResultHook(MethodHook):
+    """Результат системного выбора файлов (Activity.onActivityResult)."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if not self.plugin.is_current():
+            return
+        try:
+            offset = (_to_int(param.args[0]) & 0xFFFF) - REQ_BASE
+            if offset < 0 or offset > len(ROLES):
+                return
+            if _to_int(param.args[1]) != -1:  # RESULT_OK
+                return
+            uris = _collect_uris(param.args[2])
+            slot = None if offset == 0 else ROLES[offset - 1]
+            self.plugin.on_files_picked(uris, slot)
+        except Exception:
+            self.plugin.event("activity result: %s" % traceback.format_exc())
+
+
+class HookManager:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.font_unhooks = []
+        self.other_unhooks = []
+        self.status = {}             # точка -> число хуков или текст ошибки
+        self.result_hooked = set()   # классы с перехваченным onActivityResult
+
+    # ---- утилиты ------------------------------------------------------------
+    def _hook(self, bucket, label, member, handler):
+        try:
+            unhook = self.plugin.hook_method(member, handler)
+        except Exception as e:
+            self.status[label] = "ошибка: %s" % e
+            self.plugin.event("hook %s: %s" % (label, e))
+            return 0
+        if unhook is not None:
+            bucket.append(unhook)
+        prev = self.status.get(label)
+        self.status[label] = (prev if isinstance(prev, int) else 0) + 1
+        return 1
+
+    def _param_types(self, names):
+        types = []
+        for n in names:
+            c = J.cls(n)
+            if c is None:
+                return None
+            types.append(c)
+        return types
+
+    def _declared(self, bucket, label, cls_name, name, handler, param_names):
+        c = J.cls(cls_name)
+        if c is None:
+            self.status[label] = "нет класса"
+            return 0
+        n = 0
+        try:
+            for m in c.getDeclaredMethods():
+                try:
+                    if m.getName() != name or m.isBridge():
+                        continue
+                    types = m.getParameterTypes()
+                    if len(types) != len(param_names):
+                        continue
+                    if any(t.getName() != p for t, p in zip(types, param_names)):
+                        continue
+                    n += self._hook(bucket, label, m, handler)
+                except Exception:
+                    pass
+        except Exception as e:
+            self.status[label] = "ошибка: %s" % e
+            return 0
+        if n == 0 and label not in self.status:
+            self.status[label] = "нет метода"
+        return n
+
+    def _ctor(self, bucket, label, cls_name, handler, param_names=None):
+        c = J.cls(cls_name)
+        if c is None:
+            self.status[label] = "нет класса"
+            return 0
+        try:
+            if param_names is None:
+                ctors = list(c.getDeclaredConstructors())
+            else:
+                types = self._param_types(param_names)
+                if types is None:
+                    self.status[label] = "нет типа параметра"
+                    return 0
+                ctors = [c.getDeclaredConstructor(*types)]
+        except Exception as e:
+            self.status[label] = "нет конструктора"
+            self.plugin.event("ctor %s: %s" % (label, e))
+            return 0
+        return sum(self._hook(bucket, label, k, handler) for k in ctors)
+
+    # ---- шрифтовые хуки -----------------------------------------------------
+    def install_font_hooks(self, opts):
+        self.uninstall_font_hooks()
+        plugin = self.plugin
+        b = self.font_unhooks
+        for key in list(self.status):
+            if not key.startswith("onActivityResult"):
+                del self.status[key]
+
+        # Слой 1: провайдеры шрифтов приложения (asset-ключи fonts/r*.ttf).
+        provider = _ProviderHook(plugin)
+        for cls_name, method in ((AU_CLASS, "getTypeface"),
+                                 (FONT_UTILS_CLASS, "getSystemTypeface"),
+                                 (FONT_UTILS_CLASS, "getFontFromAssets")):
+            label = "%s.%s" % (cls_name.rsplit(".", 1)[-1], method)
+            self._declared(b, label, cls_name, method, provider, ("java.lang.String",))
+
+        # Слой 2: фабрика android.graphics.Typeface — только системные гарнитуры.
+        self._declared(b, "Typeface.create(String,int)", TF_CLASS, "create",
+                       _CreateByNameHook(plugin), ("java.lang.String", "int"))
+        self._declared(b, "Typeface.create(Typeface,int)", TF_CLASS, "create",
+                       _CreateByFamilyHook(plugin), (TF_CLASS, "int"))
+        if sdk_int() >= 28:
+            self._declared(b, "Typeface.create(Typeface,int,boolean)", TF_CLASS, "create",
+                           _CreateWeightHook(plugin), (TF_CLASS, "int", "boolean"))
+        self._declared(b, "Typeface.defaultFromStyle", TF_CLASS, "defaultFromStyle",
+                       _DefaultFromStyleHook(plugin), ("int",))
+
+        # Слой 3: конструкторы текстовых вью (O(1) на создание вью).
+        if opts.get("hook_constructors", True):
+            self._ctor(b, "TextView.<init>", "android.widget.TextView", _TextViewCtorHook(plugin),
+                       ("android.content.Context", "android.util.AttributeSet", "int", "int"))
+            self._ctor(b, "AnimatedTextDrawable.<init>",
+                       "org.telegram.ui.Components.AnimatedTextView$AnimatedTextDrawable",
+                       _PaintOwnerCtorHook(plugin))
+            self._ctor(b, "Components.Text.<init>", "org.telegram.ui.Components.Text",
+                       _TypefaceArgHook(plugin, 2), ("java.lang.CharSequence", "float", TF_CLASS))
+
+        # Слой 4 (по желанию): все новые TextPaint без гарнитуры.
+        if opts.get("deep_mode", False):
+            hook = _TextPaintCtorHook(plugin)
+            self._ctor(b, "TextPaint()", "android.text.TextPaint", hook, ())
+            self._ctor(b, "TextPaint(int)", "android.text.TextPaint", hook, ("int",))
+        total = sum(v for v in self.status.values() if isinstance(v, int))
+        plugin.log("font hooks installed: %d -> %s" % (total, self.status))
+
+    def uninstall_font_hooks(self):
+        for u in self.font_unhooks:
+            try:
+                self.plugin.unhook_method(u)
+            except Exception:
+                pass
+        self.font_unhooks = []
+
+    @property
+    def font_hooks_active(self):
+        return bool(self.font_unhooks)
+
+    # ---- перехват результата выбора файла ----------------------------------
+    def ensure_result_hook(self, start_cls):
+        """Найти onActivityResult(int,int,Intent) в иерархии и перехватить."""
+        try:
+            c = start_cls
+            while c is not None:
+                name = c.getName()
+                if name in self.result_hooked:
+                    return True
+                for m in c.getDeclaredMethods():
+                    try:
+                        if m.getName() == "onActivityResult" and len(m.getParameterTypes()) == 3:
+                            m.setAccessible(True)
+                            label = "onActivityResult (%s)" % name.rsplit(".", 1)[-1]
+                            if self._hook(self.other_unhooks, label, m, _ActivityResultHook(self.plugin)):
+                                self.result_hooked.add(name)
+                                return True
+                    except Exception:
+                        pass
+                if name in ("android.app.Activity", "java.lang.Object"):
+                    break
+                c = c.getSuperclass()
+        except Exception as e:
+            self.plugin.event("result hook: %s" % e)
+        return False
+
+    def uninstall_all(self):
+        self.uninstall_font_hooks()
+        for u in self.other_unhooks:
+            try:
+                self.plugin.unhook_method(u)
+            except Exception:
+                pass
+        self.other_unhooks = []
+        self.result_hooked = set()
+
+
+# ----------------------------------------------------------------------------
+# PaintPatcher — статические Paint в Theme (текст сообщений, список чатов,
+# имена, время…). Они создаются один раз и держат старую гарнитуру, поэтому
+# их нужно обновить вручную. Разовый проход, оригиналы запоминаются для отката.
+# ----------------------------------------------------------------------------
+class PaintPatcher:
+    CLASSES = ("org.telegram.ui.ActionBar.Theme",)
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._fields = None
+        self._orig = {}
+        self.patched = 0
+        self.total = 0
+
+    def _paint_fields(self):
+        if self._fields is not None:
+            return self._fields
+        fields = []
+        paint_cls = J.cls("android.graphics.Paint")
+        try:
+            Modifier = jclass("java.lang.reflect.Modifier")
+        except Exception:
+            Modifier = None
+        if paint_cls is None or Modifier is None:
+            self._fields = fields
+            return fields
+        for name in self.CLASSES:
+            c = J.cls(name)
+            if c is None or paint_cls is None:
+                continue
+            for f in c.getDeclaredFields():
+                try:
+                    if not Modifier.isStatic(f.getModifiers()):
+                        continue
+                    t = f.getType()
+                    is_array = bool(t.isArray())
+                    target = t.getComponentType() if is_array else t
+                    if target is None or not paint_cls.isAssignableFrom(target):
+                        continue
+                    f.setAccessible(True)
+                    fields.append((f, is_array))
+                except Exception:
+                    pass
+        self._fields = fields
+        return fields
+
+    def _paints(self):
+        fields = self._paint_fields()
+        if not fields:
+            return
+        Array = jclass("java.lang.reflect.Array")
+        for f, is_array in fields:
+            try:
+                value = f.get(None)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if not is_array:
+                yield value
+                continue
+            try:
+                for i in range(Array.getLength(value)):
+                    p = Array.get(value, i)
+                    if p is not None:
+                        yield p
+            except Exception:
+                pass
+
+    def apply(self, core, fs):
+        patched = total = 0
+        for p in self._paints():
+            total += 1
+            try:
+                cur = p.getTypeface()
+                new = _replacement(core, fs, cur)
+                if new is None:
+                    if cur is not None and core.is_ours(cur):
+                        patched += 1
+                    continue
+                if p not in self._orig:
+                    self._orig[p] = cur
+                p.setTypeface(new)
+                patched += 1
+            except Exception:
+                pass
+        self.patched, self.total = patched, total
+        return patched
+
+    def restore(self, core):
+        for p, orig in list(self._orig.items()):
+            try:
+                cur = p.getTypeface()
+                if cur is None or core.is_ours(cur):
+                    p.setTypeface(orig)
+            except Exception:
+                pass
+        self._orig.clear()
+        originals = {}
+        for p in self._paints():
+            try:
+                cur = p.getTypeface()
+                if cur is None or not core.is_ours(cur):
+                    continue
+                role = core.ours.get(cur) or "regular"
+                if role not in originals:
+                    originals[role] = core.original_for(role)
+                p.setTypeface(originals[role])
+            except Exception:
+                pass
+        self.patched = 0
+
+
+# ----------------------------------------------------------------------------
+# DefaultSetter — Typeface.setDefault (best-effort: на новых Android может быть
+# закрыт ограничениями скрытого API, тогда работают остальные слои).
+# ----------------------------------------------------------------------------
+class DefaultSetter:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._orig = None
+        self._applied = False
+        self.status = "не применялся"
+
+    def _method(self):
+        tf_cls = J.cls(TF_CLASS)
+        m = tf_cls.getDeclaredMethod("setDefault", tf_cls)
+        m.setAccessible(True)
+        return m
+
+    def apply(self, tf):
+        try:
+            if self._orig is None:
+                self._orig = jclass(TF_CLASS).DEFAULT
+            with _Guard():
+                self._method().invoke(None, tf)
+            self._applied = True
+            self.status = "применён"
+        except Exception as e:
+            self.status = "недоступен (%s)" % e.__class__.__name__
+
+    def restore(self):
+        if not self._applied or self._orig is None:
+            return
+        try:
+            with _Guard():
+                self._method().invoke(None, self._orig)
+        except Exception:
+            pass
+        self._applied = False
+        self.status = "восстановлен"
+
+
+# ----------------------------------------------------------------------------
+# FontStore — файлы шрифта и метаданные в памяти приложения.
+# Новый файл всегда пишется под новым именем и подставляется через rename:
+# перезапись на месте файла, который Android держит в mmap, может уронить
+# приложение.
+# ----------------------------------------------------------------------------
+class FontStore:
+    def __init__(self, root):
+        self.root = root
+        self.meta = None
+        self.lock = threading.RLock()
+
+    @property
+    def meta_path(self):
+        return os.path.join(self.root, "meta.json")
+
+    def path(self, filename):
+        return os.path.join(self.root, filename)
+
+    def load(self):
+        meta = None
+        try:
+            with open(self.meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            reg = meta.get("slots", {}).get("regular")
+            if not reg or not os.path.isfile(self.path(reg["file"])):
+                meta = None
+        except Exception:
+            meta = None
+        self.meta = meta
+        return meta
+
+    def slot_paths(self, meta=None):
+        meta = meta or self.meta or {}
+        out = {}
+        for role, slot in (meta.get("slots") or {}).items():
+            p = self.path(slot.get("file", ""))
+            if role in ROLES and os.path.isfile(p):
+                out[role] = {"path": p, "info": slot}
+        return out
+
+    def commit(self, chosen, replace_all, source, origin):
+        """chosen: роль -> cand(dict path/name/info). Возвращает новые метаданные."""
+        with self.lock:
+            os.makedirs(self.root, exist_ok=True)
+            stamp = int(time.time() * 1000)
+            slots = {} if (replace_all or not self.meta) else dict(self.meta.get("slots") or {})
+            for role, cand in chosen.items():
+                info = dict(cand["info"])
+                ext = ".otf" if info.get("format", "").startswith("OpenType") else ".ttf"
+                if info.get("collection"):
+                    ext = ".ttc"
+                filename = "%s-%d%s" % (role, stamp, ext)
+                dst = self.path(filename)
+                tmp = dst + ".part"
+                shutil.copyfile(cand["path"], tmp)
+                os.replace(tmp, dst)
+                info.update(file=filename, name=cand.get("name", ""))
+                slots[role] = info
+            reg = slots.get("regular") or {}
+            meta = {
+                "version": 1,
+                "family": reg.get("family") or "",
+                "source": source,
+                "origin": origin,
+                "updated": int(time.time()),
+                "slots": slots,
+            }
+            tmp = self.meta_path + ".part"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.meta_path)
+            self.meta = meta
+            self._cleanup()
+            return meta
+
+    def remove_slot(self, role):
+        with self.lock:
+            if not self.meta or role == "regular" or role not in self.meta.get("slots", {}):
+                return False
+            meta = dict(self.meta)
+            meta["slots"] = dict(meta["slots"])
+            del meta["slots"][role]
+            tmp = self.meta_path + ".part"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.meta_path)
+            self.meta = meta
+            self._cleanup()
+            return True
+
+    def clear(self):
+        with self.lock:
+            self.meta = None
+            try:
+                os.remove(self.meta_path)
+            except Exception:
+                pass
+            self._cleanup()
+
+    def _cleanup(self):
+        keep = {"meta.json"}
+        for slot in ((self.meta or {}).get("slots") or {}).values():
+            keep.add(slot.get("file"))
+        try:
+            for name in os.listdir(self.root):
+                if name not in keep:
+                    try:
+                        os.remove(os.path.join(self.root, name))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Основной класс плагина
+# ----------------------------------------------------------------------------
+class NelyFontsPlugin(BasePlugin):
+    OPTION_DEFAULTS = {
+        "keep_monospace": True,
+        "keep_serif": False,
+        "medium_as_bold": True,
+        "hook_constructors": True,
+        "deep_mode": False,
+    }
+
+    # -- lifecycle ------------------------------------------------------------
+    def on_plugin_load(self):
+        self._token = object()
+        setattr(sys, OWNER_ATTR, self._token)
+        self._events = deque(maxlen=80)
+        self._import_lock = threading.Lock()
+        self._apply_lock = threading.RLock()
+        self._last_pick = (None, 0.0)
+        self._listener_cls = None
+        self._scan_cache = {}
+        self.fs_built = None
+        self.core = FontCore(self)
+        self.hooks = HookManager(self)
+        self.patcher = PaintPatcher(self)
+        self.default_setter = DefaultSetter(self)
+        self.opts = {}
+        try:
+            self._read_opts()
+            self.store = FontStore(self._data_dir())
+            self.store.load()
+            self.core.capture_originals()
+            launch = J.cls("org.telegram.ui.LaunchActivity")
+            if launch is not None:
+                self.hooks.ensure_result_hook(launch)
+        except Exception:
+            self.event("load: %s" % traceback.format_exc())
+            if not hasattr(self, "store"):
+                self.store = FontStore(self._data_dir())
+        threading.Thread(target=self._boot, name="NelyFonts-boot", daemon=True).start()
+        self.log("NelyFonts %s loaded" % __version__)
+
+    def _boot(self):
+        try:
+            if not self.is_current():
+                return
+            if not self.store.meta and self._migrate_legacy():
+                return  # импорт уже применил перенесённый шрифт
+            if self._get_bool("enabled", True) and self.store.meta:
+                self._apply_current(message=None)
+        except Exception:
+            self.event("boot: %s" % traceback.format_exc())
+
+    def on_plugin_unload(self):
+        try:
+            if self.is_current():
+                setattr(sys, OWNER_ATTR, None)
+            core, hooks, patcher, setter = self.core, self.hooks, self.patcher, self.default_setter
+            core.set_fontset(None)
+            hooks.uninstall_all()
+
+            def ui():
+                try:
+                    patcher.restore(core)
+                    setter.restore()
+                    self._clear_app_cache()
+                    self._rebuild_ui()
+                except Exception:
+                    pass
+            run_on_ui_thread(ui)
+            self.log("NelyFonts unloaded")
+        except Exception:
+            self.log("unload error: %s" % traceback.format_exc())
+
+    def is_current(self):
+        return getattr(sys, OWNER_ATTR, None) is getattr(self, "_token", None)
+
+    # -- helpers --------------------------------------------------------------
+    def event(self, text):
+        line = "%s %s" % (time.strftime("%H:%M:%S"), text)
+        try:
+            self._events.append(line)
+        except Exception:
+            pass
+        try:
+            self.log(line)
+        except Exception:
+            pass
+
+    def _get_bool(self, key, default):
+        try:
+            v = self.get_setting(key, default)
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on")
+            return bool(v)
+        except Exception:
+            return default
+
+    def _read_opts(self):
+        self.opts = {k: self._get_bool(k, d) for k, d in self.OPTION_DEFAULTS.items()}
+        self.core.keep_mono = self.opts["keep_monospace"]
+        self.core.keep_serif = self.opts["keep_serif"]
+
+    def _data_dir(self):
+        try:
+            return os.path.join(str(_app_context().getFilesDir().getAbsolutePath()), DATA_DIR)
+        except Exception:
+            return os.path.join(os.getcwd(), DATA_DIR)
+
+    def _tmp_root(self):
+        try:
+            return os.path.join(str(_app_context().getCacheDir().getAbsolutePath()), TMP_DIR)
+        except Exception:
+            return os.path.join(os.getcwd(), TMP_DIR)
+
+    def _fragment(self):
+        frag = None
+        if get_last_fragment is not None:
+            try:
+                frag = get_last_fragment()
+            except Exception:
+                frag = None
+        if frag is None:
+            try:
+                frag = jclass("org.telegram.ui.LaunchActivity").getLastFragment()
+            except Exception:
+                frag = None
+        return frag
+
+    def _activity(self):
+        frag = self._fragment()
+        try:
+            act = frag.getParentActivity() if frag is not None else None
+        except Exception:
+            act = None
+        if act is None:
+            try:
+                act = jclass("org.telegram.ui.LaunchActivity").instance
+            except Exception:
+                act = None
+        return act
+
+    def _toast(self, kind, msg):
+        if BulletinHelper is None or not msg:
+            return
+
+        def show():
+            try:
+                getattr(BulletinHelper, "show_" + kind)(msg)
+            except Exception:
+                pass
+        run_on_ui_thread(show)
+
+    def toast_ok(self, msg):
+        self._toast("success", msg)
+
+    def toast_err(self, msg):
+        self._toast("error", msg)
+
+    def toast_info(self, msg):
+        self._toast("info", msg)
+
+    def _refresh_settings(self):
+        try:
+            self.set_setting("_rev", int(time.time() * 1000) % 1000000, reload_settings=True)
+        except TypeError:
+            pass
+        except Exception:
+            pass
+
+    # -- применение / снятие -------------------------------------------------
+    def _apply_current(self, message="Шрифт применён"):
+        """Собрать FontSet из сохранённых файлов (фоновый поток) и применить."""
+        with self._apply_lock:
+            meta = self.store.meta
+            if not meta:
+                return False
+            slots = self.store.slot_paths(meta)
+            fs = build_fontset(slots, self.opts.get("medium_as_bold", True), meta)
+            self.fs_built = fs
+        self._activate(fs, message)
+        return True
+
+    def _apply_current_async(self, message="Шрифт применён"):
+        def work():
+            try:
+                if not self._apply_current(message):
+                    self.toast_info("Сначала выберите шрифт")
+            except ImportFailure as e:
+                self.toast_err(str(e))
+            except Exception:
+                self.event("apply: %s" % traceback.format_exc())
+                self.toast_err("Не удалось применить шрифт — подробности в отчёте")
+        threading.Thread(target=work, name="NelyFonts-apply", daemon=True).start()
+
+    def _step(self, name, fn):
+        """Шаг применения: ошибка одного шага не срывает остальные."""
+        try:
+            fn()
+            return True
+        except Exception:
+            self.event("%s: %s" % (name, traceback.format_exc()))
+            return False
+
+    def _activate(self, fs, message):
+        core, hooks, patcher, step = self.core, self.hooks, self.patcher, self._step
+
+        def ui():
+            if not self.is_current():
+                return  # плагин уже выгружен или переустановлен
+            core.set_fontset(None)                                   # хуки становятся no-op
+            step("snapshot", core.snapshot_app_cache)                # роли гарнитур из кеша Telegram
+            step("restore paints", lambda: patcher.restore(core))    # чистое состояние перед новым шрифтом
+            hooked = step("install hooks", lambda: hooks.install_font_hooks(self.opts))
+            core.set_fontset(fs)
+            step("clear cache", self._clear_app_cache)               # Telegram заново спросит шрифты — уже у хуков
+            step("patch paints", lambda: patcher.apply(core, fs))
+            step("set default", lambda: self.default_setter.apply(fs.roles["regular"]))
+            step("rebuild", self._rebuild_ui)
+            if not hooked:
+                self.toast_err("Шрифт применён частично — подробности в отчёте")
+            elif message:
+                self.toast_ok(message)
+            if message:
+                self._refresh_settings()
+        run_on_ui_thread(ui)
+
+    def _deactivate(self, message=None):
+        core, hooks, patcher, step = self.core, self.hooks, self.patcher, self._step
+
+        def ui():
+            core.set_fontset(None)
+            step("snapshot", core.snapshot_app_cache)
+            step("uninstall hooks", hooks.uninstall_font_hooks)
+            step("restore paints", lambda: patcher.restore(core))
+            step("restore default", self.default_setter.restore)
+            step("clear cache", self._clear_app_cache)
+            step("rebuild", self._rebuild_ui)
+            if message:
+                self.toast_ok(message)
+                self._refresh_settings()
+        run_on_ui_thread(ui)
+
+    def _clear_app_cache(self):
+        """AndroidUtilities.clearTypefaceCache(): сбрасывает кеш и bold()."""
+        try:
+            with _Guard():
+                jclass(AU_CLASS).clearTypefaceCache()
+            return
+        except Exception:
+            pass
+        try:
+            au = J.cls(AU_CLASS)
+            f = au.getDeclaredField("typefaceCache")
+            f.setAccessible(True)
+            f.get(None).clear()
+            m = au.getDeclaredField("mediumTypeface")
+            m.setAccessible(True)
+            m.set(None, None)
+        except Exception as e:
+            self.event("clear cache: %s" % e)
+
+    def _rebuild_ui(self):
+        try:
+            inst = jclass("org.telegram.ui.LaunchActivity").instance
+            if inst is not None:
+                inst.rebuildAllFragments(True)
+        except Exception as e:
+            self.event("rebuild: %s" % e)
+
+    # -- выбор файлов ---------------------------------------------------------
+    def _pick_files(self, slot=None):
+        def ui():
+            act = self._activity()
+            if act is None:
+                self.toast_err("Не удалось открыть выбор файла")
+                return
+            try:
+                self.hooks.ensure_result_hook(act.getClass())
+            except Exception:
+                pass
+            Intent = jclass("android.content.Intent")
+            code = REQ_BASE + (ROLES.index(slot) + 1 if slot else 0)
+            last = None
+            for action in (Intent.ACTION_OPEN_DOCUMENT, Intent.ACTION_GET_CONTENT):
+                try:
+                    intent = Intent(action)
+                    intent.addCategory(Intent.CATEGORY_OPENABLE)
+                    intent.setType("*/*")
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    if slot is None:
+                        try:
+                            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
+                        except Exception:
+                            pass
+                    act.startActivityForResult(intent, code)
+                    return
+                except Exception as e:
+                    last = e
+            self.event("picker: %s" % last)
+            self.toast_err("Не удалось открыть выбор файла")
+        run_on_ui_thread(ui)
+
+    def on_files_picked(self, uris, slot):
+        if not uris:
+            self.toast_err("Файл не выбран")
+            return
+        key = (slot, tuple(str(u) for u in uris))
+        now = time.time()
+        if self._last_pick[0] == key and now - self._last_pick[1] < 3.0:
+            return  # тот же результат пришёл через второй хук иерархии
+        self._last_pick = (key, now)
+        self.import_async([("uri", u) for u in uris], slot=slot, source="file")
+
+    # -- импорт ---------------------------------------------------------------
+    def import_async(self, sources, slot=None, source="file", silent=False):
+        def work():
+            self._import(sources, slot, source, silent)
+        threading.Thread(target=work, name="NelyFonts-import", daemon=True).start()
+
+    def _import(self, sources, slot, source, silent=False):
+        if not self._import_lock.acquire(False):
+            if not silent:
+                self.toast_info("Импорт уже идёт, подождите")
+            return False
+        tmpdir = os.path.join(self._tmp_root(), str(int(time.time() * 1000)))
+        try:
+            if not silent:
+                self.toast_info("Импорт шрифта…")
+            os.makedirs(tmpdir, exist_ok=True)
+            files = []
+            for i, (kind, value) in enumerate(sources):
+                # Своя папка на каждый источник: одинаковые имена файлов не затрут друг друга.
+                sub_dir = os.path.join(tmpdir, "s%02d" % i)
+                os.makedirs(sub_dir, exist_ok=True)
+                files.append(self._fetch(kind, value, sub_dir))
+            cands, errors = self._expand(files)
+            if not cands:
+                raise ImportFailure(errors[0] if errors else "Не найдено ни одного шрифта")
+            if slot:
+                if slot != "regular" and not self.store.meta:
+                    raise ImportFailure("Сначала выберите основной шрифт")
+                same = [c for c in cands if bool(c["info"].get("italic")) == ROLE_ITALIC[slot]] or cands
+                chosen = {slot: min(same, key=lambda c: abs(c["info"].get("weight", 400) - ROLE_WEIGHT[slot]))}
+                replace_all = False  # меняем только выбранное начертание
+            elif len(cands) == 1:
+                chosen = {"regular": cands[0]}
+                replace_all = True
+            else:
+                chosen = assign_family(cands)
+                replace_all = True
+
+            # Пробная сборка ДО сохранения: битый шрифт не заменит рабочий.
+            merged = {} if replace_all else self.store.slot_paths()
+            for role, cand in chosen.items():
+                merged[role] = {"path": cand["path"], "info": cand["info"]}
+            build_fontset(merged, self.opts.get("medium_as_bold", True))
+
+            origin = ", ".join(c.get("name", "") for c in chosen.values())
+            meta = self.store.commit(chosen, replace_all, source, origin)
+            try:
+                self.set_setting("enabled", True)
+            except Exception:
+                pass
+            family = meta.get("family") or "шрифт"
+            parts = [ROLE_SHORT[r] for r in ROLES if r in chosen]
+            msg = "«%s» применён" % family
+            if len(chosen) > 1:
+                msg += " (%s)" % ", ".join(parts)
+            elif slot and slot != "regular":
+                msg = "Начертание «%s» добавлено" % ROLE_TITLES[slot]
+            if errors and not silent:
+                self.event("import warnings: %s" % "; ".join(errors))
+            self._apply_current(None if silent else msg)
+            return True
+        except ImportFailure as e:
+            self.event("import: %s" % e)
+            if not silent:
+                self.toast_err(str(e))
+        except Exception:
+            self.event("import: %s" % traceback.format_exc())
+            if not silent:
+                self.toast_err("Ошибка импорта — подробности в «Скопировать отчёт»")
+        finally:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            self._import_lock.release()
+        return False
+
+    def _fetch(self, kind, value, tmpdir):
+        """Скопировать источник во временный файл. -> (path, display_name)."""
+        if kind == "uri":
+            return self._fetch_uri(value, tmpdir)
+        if kind == "url":
+            try:
+                return self._download(str(value), tmpdir)
+            except ImportFailure:
+                raise
+            except Exception as e:
+                raise ImportFailure("Не удалось скачать файл: %s" % (str(e) or e.__class__.__name__)[:120])
+        if kind == "path":
+            src = str(value)
+            if not os.path.isfile(src):
+                raise ImportFailure("Файл не найден: %s" % os.path.basename(src))
+            if os.path.getsize(src) > MAX_FONT_BYTES:
+                raise ImportFailure("Файл слишком большой (больше %s)" % fmt_size(MAX_FONT_BYTES))
+            dst = os.path.join(tmpdir, safe_name(os.path.basename(src)))
+            try:
+                shutil.copyfile(src, dst)
+            except PermissionError:
+                raise ImportFailure("Нет доступа к файлу — выберите его через «Выбрать файлы шрифта»")
+            return dst, os.path.basename(src)
+        raise ImportFailure("Неизвестный источник")
+
+    def _fetch_uri(self, uri, tmpdir):
+        ctx = _app_context()
+        if isinstance(uri, str):
+            uri = jclass("android.net.Uri").parse(uri)
+        cr = ctx.getContentResolver()
+        name = ""
+        try:
+            cursor = cr.query(uri, None, None, None, None)
+            if cursor is not None:
+                try:
+                    if cursor.moveToFirst():
+                        idx = cursor.getColumnIndex("_display_name")
+                        if idx >= 0:
+                            name = cursor.getString(idx) or ""
+                finally:
+                    cursor.close()
+        except Exception:
+            pass
+        if not name:
+            try:
+                name = unquote(str(uri.getLastPathSegment() or "")).rsplit("/", 1)[-1]
+            except Exception:
+                name = ""
+        name = name or "font"
+        try:
+            stream = cr.openInputStream(uri)
+        except Exception as e:
+            raise ImportFailure("Не удалось открыть файл: %s" % e.__class__.__name__)
+        if stream is None:
+            raise ImportFailure("Не удалось открыть файл")
+        dst = os.path.join(tmpdir, safe_name(name))
+        self._copy_stream(stream, dst)
+        return dst, name
+
+    def _copy_stream(self, stream, dst):
+        # Буфер — НАСТОЯЩИЙ Java byte[] (jarray). С Python bytearray Chaquopy
+        # передаёт в read() копию, и на диск уходили нули — из-за этого импорт
+        # в старой версии «портил» любой шрифт.
+        try:
+            buf = jarray(jbyte)(65536)
+        except Exception:
+            buf = jarray(jbyte)(bytes(65536))
+        tmp = dst + ".part"
+        out = jclass("java.io.FileOutputStream")(tmp)
+        total = 0
+        try:
+            while True:
+                n = _to_int(stream.read(buf), -1)
+                if n < 0:
+                    break
+                if n == 0:
+                    continue
+                total += n
+                if total > MAX_FONT_BYTES:
+                    raise ImportFailure("Файл слишком большой (больше %s)" % fmt_size(MAX_FONT_BYTES))
+                out.write(buf, 0, n)
+        finally:
+            try:
+                out.close()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if total <= 0:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            raise ImportFailure("Файл пустой")
+        os.replace(tmp, dst)
+        return total
+
+    def _download(self, url, tmpdir):
+        URL = jclass("java.net.URL")
+        conn = None
+        for _ in range(6):
+            conn = URL(url).openConnection()
+            conn.setConnectTimeout(15000)
+            conn.setReadTimeout(30000)
+            conn.setInstanceFollowRedirects(True)
+            conn.setRequestProperty("User-Agent", "NelyFonts/%s (exteraGram plugin)" % __version__)
+            code = _to_int(conn.getResponseCode())
+            if code in (301, 302, 303, 307, 308):
+                loc = conn.getHeaderField("Location")
+                conn.disconnect()
+                if not loc:
+                    break
+                url = str(URL(URL(url), loc).toString())
+                continue
+            break
+        if code == 404:
+            raise ImportFailure("По ссылке ничего нет (404)")
+        if code != 200:
+            raise ImportFailure("Сервер ответил кодом %d" % code)
+        name = name_from_url(url)
+        try:
+            cd = conn.getHeaderField("Content-Disposition") or ""
+            m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", str(cd), re.I)
+            if m:
+                name = unquote(m.group(1))
+        except Exception:
+            pass
+        dst = os.path.join(tmpdir, safe_name(name))
+        try:
+            self._copy_stream(conn.getInputStream(), dst)
+        finally:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+        return dst, name
+
+    def _expand(self, files):
+        """Файлы -> кандидаты-шрифты (zip распаковывается рядом). -> (cands, errors)."""
+        cands, errors = [], []
+        for path, name in files:
+            try:
+                with open(path, "rb") as f:
+                    head = f.read(8)
+                kind = sniff_kind(head)
+                if kind == "font":
+                    cands.append(self._candidate(path, name))
+                elif kind == "zip":
+                    found = self._extract_zip(path, os.path.dirname(path), name, errors)
+                    if not found:
+                        errors.append("В архиве «%s» нет файлов .ttf/.otf" % name)
+                    cands.extend(found)
+                elif kind == "woff":
+                    errors.append("«%s» — это WOFF/WOFF2 (веб-шрифт). Android его не поддерживает: "
+                                  "скачайте версию TTF/OTF" % name)
+                elif kind == "html":
+                    errors.append("По ссылке открылась веб-страница, а не файл шрифта. "
+                                  "Нужна прямая ссылка на .ttf/.otf/.zip")
+                else:
+                    errors.append("«%s» не похож на файл шрифта (нужен TTF, OTF, TTC или ZIP)" % name)
+            except FontParseError as e:
+                errors.append("Шрифт «%s» повреждён: %s" % (name, e))
+            except ImportFailure as e:
+                errors.append(str(e))
+            except Exception as e:
+                errors.append("Не удалось прочитать «%s»: %s" % (name, e))
+        return cands, errors
+
+    @staticmethod
+    def _candidate(path, name):
+        with open(path, "rb") as f:
+            data = f.read()
+        return {"path": path, "name": name, "info": parse_font(data, name)}
+
+    def _extract_zip(self, path, tmpdir, name, errors):
+        found = []
+        try:
+            zf = zipfile.ZipFile(path)
+        except Exception:
+            raise ImportFailure("Архив «%s» повреждён" % name)
+        with zf:
+            entries = [i for i in zf.infolist()
+                       if not i.is_dir()
+                       and i.filename.lower().endswith(FONT_EXTS)
+                       and "__macosx" not in i.filename.lower()
+                       and not os.path.basename(i.filename).startswith("._")]
+            for idx, entry in enumerate(entries[:48]):
+                base = os.path.basename(entry.filename)
+                if entry.file_size > MAX_FONT_BYTES:
+                    errors.append("«%s» слишком большой" % base)
+                    continue
+                dst = os.path.join(tmpdir, "z%02d_%s" % (idx, safe_name(base)))
+                try:
+                    with zf.open(entry) as src, open(dst, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    found.append(self._candidate(dst, base))
+                except FontParseError as e:
+                    errors.append("Шрифт «%s» повреждён: %s" % (base, e))
+                except Exception as e:
+                    errors.append("Не удалось распаковать «%s»: %s" % (base, e))
+        return found
+
+    def _migrate_legacy(self):
+        """Перенести шрифт из старой версии (Global Font v2)."""
+        try:
+            files = str(_app_context().getFilesDir().getAbsolutePath())
+        except Exception:
+            return False
+        old = os.path.join(files, *LEGACY_FONT)
+        try:
+            if os.path.isfile(old):
+                with open(old, "rb") as f:
+                    if sniff_kind(f.read(8)) == "font":
+                        self.event("migrating legacy font")
+                        return self._import([("path", old)], None, "migrated", silent=True)
+        except Exception:
+            pass
+        return False
+
+    # -- шрифты из загрузок Telegram -----------------------------------------
+    def _download_dirs(self):
+        dirs = []
+        try:
+            FileLoader = jclass("org.telegram.messenger.FileLoader")
+            for t in (3, 5, 4):  # MEDIA_DIR_DOCUMENT, MEDIA_DIR_FILES, MEDIA_DIR_CACHE
+                try:
+                    d = FileLoader.getDirectory(t)
+                    if d is not None:
+                        dirs.append(str(d.getAbsolutePath()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            Env = jclass("android.os.Environment")
+            dl = str(Env.getExternalStoragePublicDirectory(Env.DIRECTORY_DOWNLOADS).getAbsolutePath())
+            dirs += [dl, os.path.join(dl, "Telegram"), os.path.join(dl, "Telegram", "Telegram Files")]
+            docs = str(Env.getExternalStoragePublicDirectory(Env.DIRECTORY_DOCUMENTS).getAbsolutePath())
+            dirs.append(docs)
+        except Exception:
+            pass
+        seen, out = set(), []
+        for d in dirs:
+            if d and d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
+
+    def scan_downloads(self, limit=40):
+        found = []
+        for d in self._download_dirs():
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if not e.is_file():
+                                continue
+                            low = e.name.lower()
+                            is_font = low.endswith(FONT_EXTS)
+                            if not is_font and not low.endswith(".zip"):
+                                continue
+                            st = e.stat()
+                            found.append((st.st_mtime, e.path, e.name, st.st_size, is_font))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        found.sort(reverse=True)
+        out = []
+        for mtime, path, name, size, is_font in found:
+            if len(out) >= limit:
+                break
+            label = self._describe_file(path, name, size, mtime, is_font)
+            if label:
+                out.append((path, label))
+        return out
+
+    def _describe_file(self, path, name, size, mtime, is_font):
+        key = (path, size, mtime)
+        if key in self._scan_cache:
+            return self._scan_cache[key]
+        label = None
+        try:
+            if is_font:
+                family = ""
+                if size <= 3 * 1024 * 1024:
+                    with open(path, "rb") as f:
+                        family = parse_font(f.read(), name).get("family", "")
+                label = "%s — %s, %s" % (family or name, name, fmt_size(size)) if family else "%s, %s" % (name, fmt_size(size))
+            else:
+                with zipfile.ZipFile(path) as zf:
+                    count = sum(1 for n in zf.namelist() if n.lower().endswith(FONT_EXTS) and "__macosx" not in n.lower())
+                if count:
+                    label = "%s — архив, шрифтов: %d" % (name, count)
+        except Exception:
+            label = None if not is_font else "%s, %s (не читается)" % (name, fmt_size(size))
+        self._scan_cache[key] = label
+        return label
+
+    # -- обслуживание ---------------------------------------------------------
+    def _install_preset(self):
+        self.import_async([("url", PRESET_URL)], source="preset")
+
+    def _on_url(self, value):
+        # Небольшая задержка: если поле присылает изменения по мере ввода,
+        # скачивание начнётся только когда ссылка перестанет меняться.
+        timer = getattr(self, "_url_timer", None)
+        if timer is not None:
+            timer.cancel()
+        kind, val = normalize_source(value)
+        if not kind or (kind == "url" and "." not in val.split("://", 1)[-1]):
+            return
+
+        def go():
+            self.import_async([(kind, val)], source="link")
+        self._url_timer = threading.Timer(1.2, go)
+        self._url_timer.daemon = True
+        self._url_timer.start()
+
+    def _on_enabled(self, value):
+        if value:
+            if self.store.meta:
+                self._apply_current_async("Шрифт включён")
+            else:
+                self.toast_info("Теперь выберите файл шрифта")
+        else:
+            self._deactivate("Возвращён стандартный шрифт")
+
+    def _on_option(self, key, value):
+        self.opts[key] = bool(value)
+        self.core.keep_mono = self.opts.get("keep_monospace", True)
+        self.core.keep_serif = self.opts.get("keep_serif", False)
+        if self._get_bool("enabled", True) and self.store.meta:
+            self._apply_current_async("Настройки применены")
+
+    def _remove_slot(self, role):
+        if self.store.remove_slot(role):
+            self._apply_current_async("Начертание «%s» убрано" % ROLE_TITLES[role])
+
+    def _reset(self):
+        def work():
+            self.store.clear()
+            self.fs_built = None
+            self._deactivate("Шрифт удалён, возвращён стандартный")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _restart_app(self):
+        def ui():
+            try:
+                jclass("com.radolyn.ayugram.utils.AyuUtils").restartApplication()
+                return
+            except Exception:
+                pass
+            try:
+                ctx = self._activity() or _app_context()
+                intent = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName())
+                Intent = jclass("android.content.Intent")
+                ctx.startActivity(Intent.makeRestartActivityTask(intent.getComponent()))
+                jclass("java.lang.System").exit(0)
+            except Exception as e:
+                self.event("restart: %s" % e)
+                self.toast_err("Не удалось перезапустить — закройте приложение вручную")
+        run_on_ui_thread(ui)
+
+    def _confirm(self, title, message, ok_text, action):
+        def ui():
+            frag = self._fragment()
+            if frag is None:
+                action()
+                return
+            try:
+                if self._listener_cls is None:
+                    iface = J.proxy("org.telegram.ui.ActionBar.AlertDialog$OnButtonClickListener")
+
+                    class _Listener(dynamic_proxy(iface)):
+                        def __init__(self, fn):
+                            super().__init__()
+                            self.fn = fn
+
+                        def onClick(self, dialog, which):
+                            try:
+                                self.fn()
+                            except Exception:
+                                pass
+                    self._listener_cls = _Listener
+                Builder = J.proxy("org.telegram.ui.ActionBar.AlertDialog$Builder")
+                ctx = frag.getParentActivity() or frag.getContext()
+                b = Builder(ctx)
+                b.setTitle(title)
+                b.setMessage(message)
+                b.setPositiveButton(ok_text, self._listener_cls(action))
+                b.setNegativeButton("Отмена", None)
+                frag.showDialog(b.create())
+            except Exception as e:
+                self.event("dialog: %s" % e)
+                action()
+        run_on_ui_thread(ui)
+
+    # -- диагностика ----------------------------------------------------------
+    def _tree_snapshot(self):
+        total = ours = 0
+        misses = {}
+        act = self._activity()
+        if act is None:
+            return total, ours, misses
+        TextView = J.proxy("android.widget.TextView")
+        ViewGroup = J.proxy("android.view.ViewGroup")
+        painted = [J.proxy(n) for n in ("org.telegram.ui.ActionBar.SimpleTextView",
+                                         "org.telegram.ui.Components.AnimatedTextView")]
+        painted = [p for p in painted if p is not None]
+        stack = [act.getWindow().getDecorView()]
+        while stack and total < 3000:
+            v = stack.pop()
+            try:
+                tf = None
+                counted = False
+                if TextView is not None and isinstance(v, TextView):
+                    tf, counted = v.getTypeface(), True
+                else:
+                    for cls in painted:
+                        if isinstance(v, cls):
+                            tf, counted = v.getPaint().getTypeface(), True
+                            break
+                if counted and v.getVisibility() == 0:
+                    total += 1
+                    if self.core.is_ours(tf):
+                        ours += 1
+                    else:
+                        name = v.getClass().getName().rsplit(".", 1)[-1]
+                        misses[name] = misses.get(name, 0) + 1
+                if ViewGroup is not None and isinstance(v, ViewGroup):
+                    for i in range(v.getChildCount()):
+                        stack.append(v.getChildAt(i))
+            except Exception:
+                pass
+        return total, ours, misses
+
+    def _run_tree_snapshot(self):
+        def ui():
+            if self.core.fs is None:
+                self.toast_info("Шрифт сейчас не активен")
+                return
+            try:
+                total, ours, misses = self._tree_snapshot()
+                pct = int(ours * 100 / total) if total else 0
+                self.event("screen: %d/%d (%d%%), misses: %s" % (ours, total, pct, misses))
+                self.toast_info("Экран: %d из %d текстов (%d%%) вашим шрифтом" % (ours, total, pct))
+            except Exception:
+                self.event("snapshot: %s" % traceback.format_exc())
+        run_on_ui_thread(ui)
+
+    def _report(self):
+        lines = ["NelyFonts %s" % __version__]
+        try:
+            bv = jclass("org.telegram.messenger.BuildVars")
+            lines.append("Приложение: %s (%s)" % (bv.BUILD_VERSION_STRING, bv.BUILD_VERSION))
+        except Exception:
+            pass
+        lines.append("Android SDK: %s" % sdk_int())
+        lines.append("Активен: %s" % ("да" if self.core.fs is not None else "нет"))
+        meta = self.store.meta or {}
+        lines.append("Шрифт: %s (источник: %s)" % (meta.get("family") or "—", meta.get("source") or "—"))
+        for role in ROLES:
+            s = (meta.get("slots") or {}).get(role)
+            if s:
+                lines.append("  %s: %s · %s · %s · вес %s%s" % (
+                    role, s.get("name") or s.get("file"), s.get("format"), fmt_size(s.get("size")),
+                    s.get("weight"), " · вариативный" if s.get("variable") else ""))
+        if self.fs_built is not None:
+            lines.append("Настоящие начертания: %s" % ", ".join(r for r in ROLES if r in self.fs_built.real))
+        lines.append("Настройки: %s" % self.opts)
+        lines.append("Хуки:")
+        for k, v in self.hooks.status.items():
+            lines.append("  %s: %s" % (k, v))
+        lines.append("Paint темы: %d из %d" % (self.patcher.patched, self.patcher.total))
+        lines.append("Typeface.setDefault: %s" % self.default_setter.status)
+        lines.append("События:")
+        lines.extend("  " + e for e in list(self._events)[-25:])
+        return "\n".join(lines)
+
+    def _copy_report(self):
+        text = self._report()
+        done = False
+        if copy_to_clipboard is not None:
+            try:
+                copy_to_clipboard(text)
+                done = True
+            except Exception:
+                done = False
+        if not done:
+            try:
+                done = bool(jclass(AU_CLASS).addToClipboard(text))
+            except Exception:
+                done = False
+        if done:
+            self.toast_ok("Отчёт скопирован")
+        else:
+            self.toast_err("Не удалось скопировать отчёт")
+
+    # -- settings UI ----------------------------------------------------------
+    def _status_line(self):
+        meta = getattr(self, "store", None) and self.store.meta
+        if not meta:
+            return "Шрифт не выбран"
+        reg = meta["slots"]["regular"]
+        state = "активен" if self.core.fs is not None else "выключен"
+        extra = len(meta["slots"]) - 1
+        text = "%s — %s" % (meta.get("family") or reg.get("name") or "шрифт", state)
+        if extra:
+            text += ", +%d нач." % extra
+        if reg.get("latin") and not reg.get("cyrillic"):
+            text += " · нет кириллицы"
+        return text
+
+    def _page_inspector(self):
+        rows = [Header(text="Текущий шрифт")]
+        meta = self.store.meta
+        if not meta:
+            rows.append(Text(text="Шрифт не выбран", icon="msg_info"))
+            return rows
+        reg = meta["slots"]["regular"]
+        info = [
+            "Семейство: %s" % (meta.get("family") or "—"),
+            "Формат: %s" % reg.get("format", "—"),
+            "Глифов: %s" % reg.get("glyphs", "—"),
+            "Латиница: %s · Кириллица: %s · Цифры: %s" % tuple(
+                "есть" if reg.get(k) else "нет" for k in ("latin", "cyrillic", "digits")),
+        ]
+        if reg.get("variable"):
+            axes = ", ".join("%s %g–%g" % (t, a[0], a[2]) for t, a in reg.get("axes", {}).items())
+            info.append("Вариативный: %s" % axes)
+        if not reg.get("cyrillic"):
+            info.append("В шрифте нет кириллицы — русские буквы будут системным шрифтом.")
+        rows.append(Divider(text="\n".join(info)))
+        rows.append(Header(text="Начертания"))
+        real = self.fs_built.real if self.fs_built is not None else set()
+        for role in ROLES:
+            slot = meta["slots"].get(role)
+            if slot:
+                desc = "%s, %s" % (slot.get("name") or slot.get("file"), fmt_size(slot.get("size")))
+            elif role in real:
+                desc = "из осей вариативного шрифта"
+            else:
+                desc = "синтезируется"
+            rows.append(Text(text="%s: %s" % (ROLE_TITLES[role], desc), icon="msg_photo_text_regular"))
+        rows.append(Header(text="Состояние"))
+        state = ["Активен: %s" % ("да" if self.core.fs is not None else "нет"),
+                 "Android SDK: %s" % sdk_int(),
+                 "Paint темы: %d из %d" % (self.patcher.patched, self.patcher.total),
+                 "Typeface.setDefault: %s" % self.default_setter.status]
+        for k, v in self.hooks.status.items():
+            state.append("%s: %s" % (k, v))
+        rows.append(Divider(text="\n".join(state)))
+        return rows
+
+    def _page_slots(self):
+        rows = [Header(text="Начертания семейства")]
+        meta = self.store.meta
+        if not meta:
+            rows.append(Text(text="Сначала выберите основной шрифт", icon="msg_info",
+                             on_click=lambda *_: self._pick_files()))
+            return rows
+        for role in ROLES:
+            slot = meta["slots"].get(role)
+            state = (slot.get("name") or slot.get("file")) if slot else "не задано"
+            rows.append(Text(text="%s: %s" % (ROLE_TITLES[role], state), icon="msg_openin",
+                             accent=slot is None, on_click=lambda *_, r=role: self._pick_files(slot=r)))
+        removable = [r for r in ROLES if r != "regular" and r in meta["slots"]]
+        if removable:
+            rows.append(Divider())
+            for role in removable:
+                rows.append(Text(text="Убрать «%s»" % ROLE_TITLES[role], icon="msg_delete", red=True,
+                                 on_click=lambda *_, r=role: self._remove_slot(r)))
+        rows.append(Divider(text="Нажмите на начертание, чтобы выбрать для него файл. Незаданные начертания "
+                                 "синтезируются из обычного: жирный — утолщением, курсив — наклоном. "
+                                 "Проще всего выбрать сразу несколько файлов или ZIP с семейством — "
+                                 "начертания распределятся сами."))
+        return rows
+
+    def _page_downloads(self):
+        rows = [Header(text="Шрифты из загрузок Telegram")]
+        try:
+            items = self.scan_downloads()
+        except Exception:
+            items = []
+            self.event("scan: %s" % traceback.format_exc())
+        if not items:
+            rows.append(Text(text="Файлы шрифтов не найдены", icon="msg_info"))
+        for path, label in items:
+            rows.append(Text(text=label, icon="msg_download",
+                             on_click=lambda *_, p=path: self.import_async([("path", p)], source="downloads")))
+        rows.append(Divider(text="Отправьте .ttf/.otf/.zip в «Избранное», нажмите на файл, чтобы он скачался, "
+                                 "и вернитесь сюда — он появится в списке."))
+        return rows
+
+    def create_settings(self):
+        if Header is None:
+            return []
+        try:
+            return self._settings_items()
+        except Exception:
+            self.event("settings: %s" % traceback.format_exc())
+            return [Header(text="NelyFonts"),
+                    Text(text="Ошибка построения настроек — скопируйте отчёт", icon="msg_info"),
+                    Text(text="Скопировать отчёт", icon="msg_copy", on_click=lambda *_: self._copy_report())]
+
+    def _settings_items(self):
+        opt = self._on_option
+        return [
+            Header(text="NelyFonts"),
+            Switch(key="enabled", text="Включить NelyFonts", default=True,
+                   subtext="Ваш шрифт во всём приложении — без перезапуска",
+                   icon="msg_photo_text_regular", on_change=self._on_enabled),
+            Text(text=self._status_line(), icon="msg_photo_text_framed3",
+                 create_sub_fragment=self._page_inspector),
+            Divider(),
+
+            Header(text="Выбор шрифта"),
+            Text(text="Выбрать файлы шрифта", icon="msg_openin", accent=True,
+                 on_click=lambda *_: self._pick_files()),
+            Text(text="Шрифты из загрузок Telegram", icon="msg_download",
+                 create_sub_fragment=self._page_downloads),
+            Input(key="font_url", text="Скачать по ссылке", default="",
+                  subtext="Прямая ссылка на .ttf/.otf/.zip (GitHub, Dropbox, Google Drive…)",
+                  icon="msg_link", on_change=self._on_url),
+            Text(text="Установить %s" % PRESET_NAME, icon="msg_fave",
+                 on_click=lambda *_: self._install_preset()),
+            Text(text="Начертания семейства", icon="msg_list",
+                 create_sub_fragment=self._page_slots),
+            Divider(text="Подходят TTF, OTF, TTC и ZIP-архивы. Можно выбрать сразу несколько файлов "
+                         "(Regular, Bold, Italic…) — начертания распределятся автоматически."),
+
+            Header(text="Начертания"),
+            Switch(key="medium_as_bold", text="Средний вес как жирный", default=True,
+                   subtext="Для шрифтов без Medium: имена и заголовки станут жирными",
+                   icon="msg_photo_text2", on_change=lambda v: opt("medium_as_bold", v)),
+            Switch(key="keep_monospace", text="Оставить моноширинный шрифт", default=True,
+                   subtext="Код и `моно` в сообщениях", icon="msg_text_outlined",
+                   on_change=lambda v: opt("keep_monospace", v)),
+            Switch(key="keep_serif", text="Оставить шрифт с засечками", default=False,
+                   subtext="Заголовки Instant View и редактора", icon="msg_photo_text_framed",
+                   on_change=lambda v: opt("keep_serif", v)),
+            Divider(),
+
+            Header(text="Покрытие"),
+            Switch(key="hook_constructors", text="Текстовые элементы при создании", default=True,
+                   subtext="TextView и анимированный текст — без затрат на кадр",
+                   icon="msg_customize", on_change=lambda v: opt("hook_constructors", v)),
+            Switch(key="deep_mode", text="Глубокий режим", default=False,
+                   subtext="Ловит редкие места со стандартным шрифтом. Чуть больше нагрузки",
+                   icon="msg_stats", on_change=lambda v: opt("deep_mode", v)),
+            Divider(),
+
+            Header(text="Обслуживание"),
+            Text(text="Применить заново", icon="msg_retry",
+                 on_click=lambda *_: self._apply_current_async("Шрифт применён заново")),
+            Text(text="Перезапустить приложение", icon="msg_reset",
+                 on_click=lambda *_: self._confirm(
+                     "Перезапуск", "Перезапустить приложение, чтобы шрифт применился везде, "
+                                   "включая уже открытые чаты?", "Перезапустить", self._restart_app)),
+            Text(text="Удалить шрифт", icon="msg_delete", red=True,
+                 on_click=lambda *_: self._confirm(
+                     "Удалить шрифт", "Удалить выбранный шрифт и вернуть стандартный?",
+                     "Удалить", self._reset)),
+            Divider(),
+
+            Header(text="Диагностика"),
+            Text(text="Проверить текущий экран", icon="msg_search",
+                 on_click=lambda *_: self._run_tree_snapshot()),
+            Text(text="Скопировать отчёт", icon="msg_copy",
+                 on_click=lambda *_: self._copy_report()),
+            Divider(text="NelyFonts %s · %s" % (__version__, __author__)),
+        ]
