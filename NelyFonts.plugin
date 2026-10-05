@@ -2,7 +2,7 @@ __id__ = "nelyfonts"
 __name__ = "NelyFonts"
 __description__ = "Глобальная замена шрифта в exteraGram и AyuGram. Импорт TTF/OTF/TTC и ZIP-архивов из файлов, загрузок Telegram или по ссылке, целые семейства начертаний, вариативные шрифты, горячая смена без перезапуска и диагностика покрытия."
 __author__ = "@NeLydim"
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 __min_version__ = "12.1.1"
 __app_version__ = ">=12.1.1"
 __icon__ = "Neuro424/91"
@@ -650,6 +650,38 @@ def sdk_int():
     return _SDK[0]
 
 
+def static_field(cls, name, matches):
+    """Статическое поле по имени, а если в этой сборке его переименовали —
+    первое статическое поле, для которого matches(field) истинно."""
+    try:
+        f = cls.getDeclaredField(name)
+        f.setAccessible(True)
+        return f
+    except Exception:
+        pass
+    Modifier = jclass("java.lang.reflect.Modifier")
+    for f in cls.getDeclaredFields():
+        try:
+            if Modifier.isStatic(f.getModifiers()) and matches(f):
+                f.setAccessible(True)
+                return f
+        except Exception:
+            pass
+    raise RuntimeError("поле %s не найдено" % name)
+
+
+def typeface_cache_field(au):
+    map_cls = J.cls("java.util.Map")
+    return static_field(au, "typefaceCache",
+                        lambda f: map_cls.isAssignableFrom(f.getType())
+                        and "android.graphics.Typeface" in str(f.getGenericType()))
+
+
+def medium_typeface_field(au):
+    return static_field(au, "mediumTypeface",
+                        lambda f: f.getType().getName() == TF_CLASS and "medium" in f.getName().lower())
+
+
 def _app_context():
     try:
         return ApplicationLoader.applicationContext
@@ -849,18 +881,44 @@ class FontCore:
         except Exception as e:
             self.plugin.event("capture originals: %s" % e)
 
+    def _learn(self, tf, raw):
+        if tf is None or not raw or raw == "special":
+            return 0
+        if tf in self.ours or tf in self.known:
+            return 0
+        self.known[tf] = raw
+        return 1
+
     def snapshot_app_cache(self):
-        """Запомнить роли гарнитур из кеша Telegram (до его очистки)."""
+        """Запомнить роли штатных гарнитур Telegram (до очистки кеша).
+
+        Два способа: прочитать кеш рефлексией и спросить шрифты у самого
+        приложения (getTypeface/regular/bold) — второй работает, даже если в
+        этой сборке поле кеша недоступно. Это те же объекты, что уже стоят во
+        вью и Paint, поэтому их потом можно узнать и заменить.
+        """
         n = 0
+        try:
+            AU = jclass(AU_CLASS)
+            calls = [(key, classify_asset(key), lambda k=key: AU.getTypeface(k))
+                     for key in sorted(self.cache_keys)]
+            calls += [("regular()", "regular", lambda: AU.regular()),
+                      ("bold()", "medium", lambda: AU.bold())]
+            for _label, raw, call in calls:
+                try:
+                    with _Guard():
+                        n += self._learn(call(), raw)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             au = J.cls(AU_CLASS)
             if au is None:
-                return 0
+                return n
             cache = None
             try:
-                f = au.getDeclaredField("typefaceCache")
-                f.setAccessible(True)
-                cache = f.get(None)
+                cache = typeface_cache_field(au).get(None)
             except Exception:
                 cache = None
             if cache is not None:
@@ -1067,6 +1125,54 @@ class _TypefaceArgHook(_FontHook):
             pass
 
 
+class _PaintCtorFixHook(_FontHook):
+    """После конструктора TextPaint exteraGram (он сам ставит regular()):
+    штатная гарнитура -> наша. Ловит все SimpleTextView, ячейки и Paint'ы,
+    даже если regular() встроен ART-ом и вернул шрифт мимо кеша."""
+
+    def after_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            paint = param.thisObject
+            new = _replacement(self.core, fs, paint.getTypeface())
+            if new is not None:
+                paint.setTypeface(new)
+        except Exception:
+            pass
+
+
+class _SetTypefaceHook(MethodHook):
+    """Глубокий режим: Paint.setTypeface(штатная гарнитура) -> наша.
+
+    Самый частый хук плагина, поэтому максимально дешёвый: только словарь
+    известных штатных гарнитур, без классификации и логов.
+    """
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.core = plugin.core
+
+    def before_hooked_method(self, param):
+        core = self.core
+        fs = core.fs
+        if fs is None or _guarded() or not self.plugin.is_current():
+            return
+        try:
+            tf = param.args[0]
+            if tf is None:
+                return
+            raw = core.known.get(tf)
+            if raw is None:
+                return
+            role = core.effective(raw)
+            if role:
+                param.args[0] = fs.roles[role]
+        except Exception:
+            pass
+
+
 class _ClearCacheHook(_FontHook):
     """Кто-то (например, переключатель «Системный шрифт» exteraGram) очистил кеш
     шрифтов Telegram — сразу кладём туда наши гарнитуры снова."""
@@ -1255,6 +1361,11 @@ class HookManager:
                        _PaintOwnerCtorHook(plugin))
             self._ctor(b, "Components.Text.<init>", "org.telegram.ui.Components.Text",
                        _TypefaceArgHook(plugin, 2), ("java.lang.CharSequence", "float", TF_CLASS))
+            # «в сети» в профиле, текст закрепа и прочие SimpleTextView обычного начертания.
+            self._ctor(b, "SimpleTextView.<init>", "org.telegram.ui.ActionBar.SimpleTextView",
+                       _PaintOwnerCtorHook(plugin))
+            self._ctor(b, "TextPaint exteraGram.<init>", "com.exteragram.messenger.utils.ui.TextPaint",
+                       _PaintCtorFixHook(plugin))
 
         self._declared(b, "AndroidUtilities.clearTypefaceCache", AU_CLASS, "clearTypefaceCache",
                        _ClearCacheHook(plugin), ())
@@ -1264,6 +1375,8 @@ class HookManager:
             hook = _TextPaintCtorHook(plugin)
             self._ctor(b, "TextPaint()", "android.text.TextPaint", hook, ())
             self._ctor(b, "TextPaint(int)", "android.text.TextPaint", hook, ("int",))
+            self._declared(b, "Paint.setTypeface", "android.graphics.Paint", "setTypeface",
+                           _SetTypefaceHook(plugin), (TF_CLASS,))
         total = sum(v for v in self.status.values() if isinstance(v, int))
         plugin.log("font hooks installed: %d -> %s" % (total, self.status))
 
@@ -1704,6 +1817,7 @@ class NelyFontsPlugin(BasePlugin):
         self.patcher = PaintPatcher(self)
         self.views = ViewPatcher(self)
         self.primed = 0
+        self.cache_status = "не проверялся"
         self.default_setter = DefaultSetter(self)
         self.opts = {}
         try:
@@ -1898,6 +2012,7 @@ class NelyFontsPlugin(BasePlugin):
             # regular()/bold()/getTypeface() ART встраивает в места вызова, и хук
             # их не видит, — а кеш они читают всегда.
             step("prime cache", lambda: self.prime_app_cache(fs))
+            step("verify cache", lambda: self.verify_app_cache(fs))
             step("patch paints", lambda: patcher.apply(core, fs))
             step("set default", lambda: self.default_setter.apply(fs.roles["regular"]))
             step("rebuild", self._rebuild_ui)
@@ -1952,9 +2067,7 @@ class NelyFontsPlugin(BasePlugin):
         au = J.cls(AU_CLASS)
         if au is None:
             raise RuntimeError("AndroidUtilities не найден")
-        f = au.getDeclaredField("typefaceCache")
-        f.setAccessible(True)
-        cache = f.get(None)
+        cache = typeface_cache_field(au).get(None)
         n = 0
         for key in sorted(self.core.cache_keys):
             role = self.core.asset_role(key)
@@ -1969,13 +2082,40 @@ class NelyFontsPlugin(BasePlugin):
             except Exception:
                 pass
         try:
-            m = au.getDeclaredField("mediumTypeface")
-            m.setAccessible(True)
-            m.set(None, fs.roles["medium"])
+            medium_typeface_field(au).set(None, fs.roles["medium"])
         except Exception as e:
             self.event("prime medium: %s" % e)
         self.primed = n
         return n
+
+    def verify_app_cache(self, fs):
+        """Спросить у Telegram его шрифты так же, как это делает приложение.
+
+        Если вернулся штатный шрифт (кеш недоступен в этой сборке, встроенный
+        код и т.п.), запоминаем его как «штатный» — тогда хуки конструкторов
+        и Paint.setTypeface узнают и заменят его.
+        """
+        core = self.core
+        AU = jclass(AU_CLASS)
+        missed = []
+        calls = [(key, lambda k=key: AU.getTypeface(k)) for key in sorted(core.cache_keys)]
+        calls += [("regular()", lambda: AU.regular()), ("bold()", lambda: AU.bold())]
+        for label, call in calls:
+            raw = "regular" if label == "regular()" else ("medium" if label == "bold()" else classify_asset(label))
+            if not core.effective(raw):
+                continue
+            try:
+                tf = call()  # без _Guard: ровно как зовёт приложение, с нашими хуками
+            except Exception:
+                continue
+            if tf is not None and not core.is_ours(tf):
+                if tf not in core.known:
+                    core.known[tf] = raw
+                missed.append(label)
+        self.cache_status = "наш шрифт" if not missed else "штатный: " + ", ".join(missed)
+        if missed:
+            self.event("cache verify: %s" % self.cache_status)
+        return not missed
 
     def _later(self, fn, delay_ms):
         try:
@@ -2579,7 +2719,7 @@ class NelyFontsPlugin(BasePlugin):
         for k, v in self.hooks.status.items():
             lines.append("  %s: %s" % (k, v))
         lines.append("Paint темы: %d из %d" % (self.patcher.patched, self.patcher.total))
-        lines.append("Кеш Telegram: %d ключей" % self.primed)
+        lines.append("Кеш Telegram: %d ключей, проверка: %s" % (self.primed, self.cache_status))
         lines.append("Вью обновлено: %d" % self.views.patched)
         lines.append("Typeface.setDefault: %s" % self.default_setter.status)
         lines.append("События:")
@@ -2655,7 +2795,7 @@ class NelyFontsPlugin(BasePlugin):
         state = ["Активен: %s" % ("да" if self.core.fs is not None else "нет"),
                  "Android SDK: %s" % sdk_int(),
                  "Paint темы: %d из %d" % (self.patcher.patched, self.patcher.total),
-                 "Кеш Telegram: %d ключей" % self.primed,
+                 "Кеш Telegram: %d ключей, проверка: %s" % (self.primed, self.cache_status),
                  "Вью обновлено: %d" % self.views.patched,
                  "Typeface.setDefault: %s" % self.default_setter.status]
         for k, v in self.hooks.status.items():

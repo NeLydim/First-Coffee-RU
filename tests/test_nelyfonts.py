@@ -575,6 +575,71 @@ class TelegramCacheTest(unittest.TestCase):
         self.assertIs(self.header.tf, fs.roles["medium"])
 
 
+class UnreachableCacheTest(TelegramCacheTest):
+    """Сборка, где кеш шрифтов недоступен: шрифт всё равно доходит до новых вью."""
+
+    def setUp(self):
+        super().setUp()
+        cls = sdk_stubs.FakeAUClass
+
+        def no_field(_self, name):
+            raise Exception("NoSuchFieldException: " + name)
+        self._orig_get = cls.getDeclaredField
+        cls.getDeclaredField = no_field
+        cls.getDeclaredFields = lambda _self: []
+
+    def tearDown(self):
+        sdk_stubs.FakeAUClass.getDeclaredField = self._orig_get
+        del sdk_stubs.FakeAUClass.getDeclaredFields
+        super().tearDown()
+
+    def test_cache_primed_and_views_patched(self):
+        AU = sdk_stubs.FakeAU
+        self.assertTrue(self.plugin._import([("path", TTF)], None, "file"))
+        fs = self.plugin.core.fs
+        self.assertEqual(self.plugin.primed, 0)
+        self.assertTrue(self.plugin.cache_status.startswith("штатный"))
+        stock = AU.regular()                       # то, что получит новый SimpleTextView
+        self.assertFalse(self.plugin.core.is_ours(stock))
+
+        class Paint:
+            def __init__(self, tf):
+                self.tf = tf
+
+            def getTypeface(self):
+                return self.tf
+
+            def setTypeface(self, tf):
+                self.tf = tf
+
+        class SimpleTextView:
+            def __init__(self):
+                self.paint = Paint(AU.regular())
+
+            def getPaint(self):
+                return self.paint
+
+            def setTypeface(self, tf):
+                self.paint.tf = tf
+
+        online = SimpleTextView()                  # «в сети» в профиле
+        nf._PaintOwnerCtorHook(self.plugin).after_hooked_method(FakeParam(this=online))
+        self.assertIs(online.paint.tf, fs.roles["regular"])
+        paint = Paint(AU.regular())                # TextPaint exteraGram
+        nf._PaintCtorFixHook(self.plugin).after_hooked_method(FakeParam(this=paint))
+        self.assertIs(paint.tf, fs.roles["regular"])
+        p = FakeParam(AU.bold())                   # Paint.setTypeface(bold())
+        nf._SetTypefaceHook(self.plugin).before_hooked_method(p)
+        self.assertIs(p.args[0], fs.roles["medium"])
+        p = FakeParam(sdk_stubs.FakeTypeface("emoji"))
+        nf._SetTypefaceHook(self.plugin).before_hooked_method(p)
+        self.assertEqual(p.args[0].src, "emoji")
+        self.assertIs(self.cell.tf, fs.roles["regular"])   # уже показанные вью — проходом
+
+    test_reprime_after_external_clear = None
+    test_switching_fonts_replaces_previous = None
+
+
 class MetadataTest(unittest.TestCase):
     def test_metadata(self):
         self.assertEqual(nf.__name__, "NelyFonts")
