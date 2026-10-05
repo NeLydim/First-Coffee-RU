@@ -2,7 +2,7 @@ __id__ = "nelyfonts"
 __name__ = "NelyFonts"
 __description__ = "Глобальная замена шрифта в exteraGram и AyuGram. Импорт TTF/OTF/TTC и ZIP-архивов из файлов, загрузок Telegram или по ссылке, целые семейства начертаний, вариативные шрифты, горячая смена без перезапуска и диагностика покрытия."
 __author__ = "@NeLydim"
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 __min_version__ = "12.1.1"
 __app_version__ = ">=12.1.1"
 __icon__ = "Neuro424/91"
@@ -85,6 +85,10 @@ ROLE_ASSET = {
     "medium_italic": "fonts/rmediumitalic.ttf",
     "bold_italic": "fonts/rmediumitalic.ttf",
 }
+# Все asset-ключи, которые Telegram/exteraGram запрашивает через AndroidUtilities.getTypeface().
+PRIME_KEYS = ("fonts/rregular.ttf", "fonts/rmedium.ttf", "fonts/ritalic.ttf", "fonts/rmediumitalic.ttf",
+              "fonts/rcondensedbold.ttf", "fonts/rextrabold.ttf", "fonts/nunito_extrabold.ttf",
+              "fonts/rmono.ttf", "fonts/mw_bold.ttf", "fonts/mw_bolditalic.ttf")
 FONT_EXTS = (".ttf", ".otf", ".ttc", ".otc")
 SFNT_TAGS = (b"\x00\x01\x00\x00", b"OTTO", b"true")
 
@@ -784,6 +788,7 @@ class FontCore:
         self.keep_mono = True
         self.keep_serif = False
         self._asset_roles = {}
+        self.cache_keys = set(PRIME_KEYS)
 
     def set_fontset(self, fs):
         if fs is not None:
@@ -863,6 +868,8 @@ class FontCore:
                 while it.hasNext():
                     e = it.next()
                     k, v = e.getKey(), e.getValue()
+                    if k is not None:
+                        self.cache_keys.add(str(k))
                     raw = classify_asset(str(k)) if k is not None else None
                     # «special» (эмодзи, цифры, Impact) не запоминаем: неизвестные гарнитуры и так не трогаются.
                     if v is not None and raw and raw != "special" and v not in self.ours and v not in self.known:
@@ -1060,6 +1067,20 @@ class _TypefaceArgHook(_FontHook):
             pass
 
 
+class _ClearCacheHook(_FontHook):
+    """Кто-то (например, переключатель «Системный шрифт» exteraGram) очистил кеш
+    шрифтов Telegram — сразу кладём туда наши гарнитуры снова."""
+
+    def after_hooked_method(self, param):
+        fs = self._fs()
+        if fs is None:
+            return
+        try:
+            self.plugin.prime_app_cache(fs)
+        except Exception:
+            pass
+
+
 class _TextPaintCtorHook(_FontHook):
     """Глубокий режим: любой новый TextPaint без гарнитуры получает наш шрифт."""
 
@@ -1235,6 +1256,9 @@ class HookManager:
             self._ctor(b, "Components.Text.<init>", "org.telegram.ui.Components.Text",
                        _TypefaceArgHook(plugin, 2), ("java.lang.CharSequence", "float", TF_CLASS))
 
+        self._declared(b, "AndroidUtilities.clearTypefaceCache", AU_CLASS, "clearTypefaceCache",
+                       _ClearCacheHook(plugin), ())
+
         # Слой 4 (по желанию): все новые TextPaint без гарнитуры.
         if opts.get("deep_mode", False):
             hook = _TextPaintCtorHook(plugin)
@@ -1298,7 +1322,14 @@ class HookManager:
 # их нужно обновить вручную. Разовый проход, оригиналы запоминаются для отката.
 # ----------------------------------------------------------------------------
 class PaintPatcher:
-    CLASSES = ("org.telegram.ui.ActionBar.Theme",)
+    CLASSES = ("org.telegram.ui.ActionBar.Theme",
+               "org.telegram.ui.ArticleViewer",
+               "org.telegram.ui.Components.LetterDrawable",
+               "org.telegram.ui.Components.OtherDocumentPlaceholderDrawable",
+               "org.telegram.ui.Components.GroupCreateSpan",
+               "org.telegram.ui.Components.Reactions.ReactionsLayoutInBubble",
+               "org.telegram.ui.ContentPreviewViewer",
+               "org.telegram.ui.ActionBar.BottomSheetTabs")
 
     def __init__(self, plugin):
         self.plugin = plugin
@@ -1403,6 +1434,90 @@ class PaintPatcher:
                 p.setTypeface(originals[role])
             except Exception:
                 pass
+        self.patched = 0
+
+
+# ----------------------------------------------------------------------------
+# ViewPatcher — разовый проход по уже показанным вью (экран, боковое меню,
+# шапки): TextView/SimpleTextView/AnimatedTextView со штатной гарнитурой
+# получают наш вариант того же начертания. Боковое меню, например, не
+# пересоздаётся при rebuildAllFragments, поэтому без этого прохода оставалось
+# стандартным до перезапуска.
+# ----------------------------------------------------------------------------
+class ViewPatcher:
+    PAINTED = ("org.telegram.ui.ActionBar.SimpleTextView",
+               "org.telegram.ui.Components.AnimatedTextView")
+    LIMIT = 8000
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.patched = 0
+
+    def _roots(self):
+        roots = []
+        try:
+            inst = jclass("org.telegram.ui.LaunchActivity").instance
+            if inst is not None:
+                roots.append(inst.getWindow().getDecorView())
+        except Exception:
+            pass
+        if not roots:
+            try:
+                act = self.plugin._activity()
+                if act is not None:
+                    roots.append(act.getWindow().getDecorView())
+            except Exception:
+                pass
+        return roots
+
+    def walk(self, visit):
+        """visit(view, typeface, setter) для каждого текстового вью. -> сумма результатов."""
+        TextView = J.proxy("android.widget.TextView")
+        ViewGroup = J.proxy("android.view.ViewGroup")
+        painted = [c for c in (J.proxy(n) for n in self.PAINTED) if c is not None]
+        total = seen = 0
+        for root in self._roots():
+            stack = [root]
+            while stack and seen < self.LIMIT:
+                v = stack.pop()
+                seen += 1
+                try:
+                    if TextView is not None and isinstance(v, TextView):
+                        total += visit(v, v.getTypeface(), v.setTypeface)
+                    else:
+                        for cls in painted:
+                            if isinstance(v, cls):
+                                total += visit(v, v.getPaint().getTypeface(), v.setTypeface)
+                                break
+                    if ViewGroup is not None and isinstance(v, ViewGroup):
+                        for i in range(v.getChildCount()):
+                            stack.append(v.getChildAt(i))
+                except Exception:
+                    pass
+        return total
+
+    def apply(self, core, fs):
+        def visit(_view, tf, setter):
+            new = _replacement(core, fs, tf)
+            if new is None:
+                return 0
+            setter(new)
+            return 1
+        self.patched = self.walk(visit)
+        return self.patched
+
+    def restore(self, core):
+        originals = {}
+
+        def visit(_view, tf, setter):
+            if tf is None or not core.is_ours(tf):
+                return 0
+            role = core.ours.get(tf) or "regular"
+            if role not in originals:
+                originals[role] = core.original_for(role)
+            setter(originals[role])
+            return 1
+        self.walk(visit)
         self.patched = 0
 
 
@@ -1587,6 +1702,8 @@ class NelyFontsPlugin(BasePlugin):
         self.core = FontCore(self)
         self.hooks = HookManager(self)
         self.patcher = PaintPatcher(self)
+        self.views = ViewPatcher(self)
+        self.primed = 0
         self.default_setter = DefaultSetter(self)
         self.opts = {}
         try:
@@ -1624,13 +1741,12 @@ class NelyFontsPlugin(BasePlugin):
             hooks.uninstall_all()
 
             def ui():
-                try:
-                    patcher.restore(core)
-                    setter.restore()
-                    self._clear_app_cache()
-                    self._rebuild_ui()
-                except Exception:
-                    pass
+                for fn in (self._clear_app_cache, lambda: patcher.restore(core),
+                           lambda: self.views.restore(core), setter.restore, self._rebuild_ui):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
             run_on_ui_thread(ui)
             self.log("NelyFonts unloaded")
         except Exception:
@@ -1773,14 +1889,20 @@ class NelyFontsPlugin(BasePlugin):
             if not self.is_current():
                 return  # плагин уже выгружен или переустановлен
             core.set_fontset(None)                                   # хуки становятся no-op
-            step("snapshot", core.snapshot_app_cache)                # роли гарнитур из кеша Telegram
+            step("snapshot", core.snapshot_app_cache)                # роли штатных гарнитур из кеша Telegram
+            step("clear cache", self._clear_app_cache)               # убрать гарнитуры прошлого шрифта
             step("restore paints", lambda: patcher.restore(core))    # чистое состояние перед новым шрифтом
             hooked = step("install hooks", lambda: hooks.install_font_hooks(self.opts))
             core.set_fontset(fs)
-            step("clear cache", self._clear_app_cache)               # Telegram заново спросит шрифты — уже у хуков
+            # Главное: кладём свои гарнитуры прямо в кеш Telegram. Короткие
+            # regular()/bold()/getTypeface() ART встраивает в места вызова, и хук
+            # их не видит, — а кеш они читают всегда.
+            step("prime cache", lambda: self.prime_app_cache(fs))
             step("patch paints", lambda: patcher.apply(core, fs))
             step("set default", lambda: self.default_setter.apply(fs.roles["regular"]))
             step("rebuild", self._rebuild_ui)
+            step("patch views", lambda: self.views.apply(core, fs))
+            self._later(lambda: self._repatch_views(fs), 600)     # вью, созданные после rebuild
             if not hooked:
                 self.toast_err("Шрифт применён частично — подробности в отчёте")
             elif message:
@@ -1796,9 +1918,10 @@ class NelyFontsPlugin(BasePlugin):
             core.set_fontset(None)
             step("snapshot", core.snapshot_app_cache)
             step("uninstall hooks", hooks.uninstall_font_hooks)
+            step("clear cache", self._clear_app_cache)               # до отката: кеш больше не отдаёт наше
             step("restore paints", lambda: patcher.restore(core))
+            step("restore views", lambda: self.views.restore(core))
             step("restore default", self.default_setter.restore)
-            step("clear cache", self._clear_app_cache)
             step("rebuild", self._rebuild_ui)
             if message:
                 self.toast_ok(message)
@@ -1823,6 +1946,48 @@ class NelyFontsPlugin(BasePlugin):
             m.set(None, None)
         except Exception as e:
             self.event("clear cache: %s" % e)
+
+    def prime_app_cache(self, fs):
+        """Положить наши гарнитуры в AndroidUtilities.typefaceCache и mediumTypeface."""
+        au = J.cls(AU_CLASS)
+        if au is None:
+            raise RuntimeError("AndroidUtilities не найден")
+        f = au.getDeclaredField("typefaceCache")
+        f.setAccessible(True)
+        cache = f.get(None)
+        n = 0
+        for key in sorted(self.core.cache_keys):
+            role = self.core.asset_role(key)
+            try:
+                if role:
+                    cache.put(key, fs.roles[role])
+                    n += 1
+                else:
+                    cur = cache.get(key)
+                    if cur is not None and self.core.is_ours(cur):
+                        cache.remove(key)  # например, моно снова оставлен штатным
+            except Exception:
+                pass
+        try:
+            m = au.getDeclaredField("mediumTypeface")
+            m.setAccessible(True)
+            m.set(None, fs.roles["medium"])
+        except Exception as e:
+            self.event("prime medium: %s" % e)
+        self.primed = n
+        return n
+
+    def _later(self, fn, delay_ms):
+        try:
+            run_on_ui_thread(fn, delay_ms)
+        except TypeError:
+            threading.Timer(delay_ms / 1000.0, lambda: run_on_ui_thread(fn)).start()
+        except Exception:
+            pass
+
+    def _repatch_views(self, fs):
+        if self.is_current() and self.core.fs is fs:
+            self._step("patch views (late)", lambda: self.views.apply(self.core, fs))
 
     def _rebuild_ui(self):
         try:
@@ -2355,42 +2520,26 @@ class NelyFontsPlugin(BasePlugin):
 
     # -- диагностика ----------------------------------------------------------
     def _tree_snapshot(self):
-        total = ours = 0
+        counts = {"total": 0, "ours": 0}
         misses = {}
-        act = self._activity()
-        if act is None:
-            return total, ours, misses
-        TextView = J.proxy("android.widget.TextView")
-        ViewGroup = J.proxy("android.view.ViewGroup")
-        painted = [J.proxy(n) for n in ("org.telegram.ui.ActionBar.SimpleTextView",
-                                         "org.telegram.ui.Components.AnimatedTextView")]
-        painted = [p for p in painted if p is not None]
-        stack = [act.getWindow().getDecorView()]
-        while stack and total < 3000:
-            v = stack.pop()
-            try:
-                tf = None
-                counted = False
-                if TextView is not None and isinstance(v, TextView):
-                    tf, counted = v.getTypeface(), True
-                else:
-                    for cls in painted:
-                        if isinstance(v, cls):
-                            tf, counted = v.getPaint().getTypeface(), True
-                            break
-                if counted and v.getVisibility() == 0:
-                    total += 1
-                    if self.core.is_ours(tf):
-                        ours += 1
-                    else:
-                        name = v.getClass().getName().rsplit(".", 1)[-1]
-                        misses[name] = misses.get(name, 0) + 1
-                if ViewGroup is not None and isinstance(v, ViewGroup):
-                    for i in range(v.getChildCount()):
-                        stack.append(v.getChildAt(i))
-            except Exception:
-                pass
-        return total, ours, misses
+        core = self.core
+
+        def visit(view, tf, _setter):
+            if view.getVisibility() != 0:
+                return 0
+            if core.is_ours(tf):
+                counts["total"] += 1
+                counts["ours"] += 1
+                return 0
+            raw = core.classify(tf)
+            if raw is not None and core.effective(raw) is None:
+                return 0  # оставлено штатным намеренно (моно, засечки)
+            counts["total"] += 1
+            name = view.getClass().getName().rsplit(".", 1)[-1]
+            misses[name] = misses.get(name, 0) + 1
+            return 0
+        self.views.walk(visit)
+        return counts["total"], counts["ours"], misses
 
     def _run_tree_snapshot(self):
         def ui():
@@ -2430,6 +2579,8 @@ class NelyFontsPlugin(BasePlugin):
         for k, v in self.hooks.status.items():
             lines.append("  %s: %s" % (k, v))
         lines.append("Paint темы: %d из %d" % (self.patcher.patched, self.patcher.total))
+        lines.append("Кеш Telegram: %d ключей" % self.primed)
+        lines.append("Вью обновлено: %d" % self.views.patched)
         lines.append("Typeface.setDefault: %s" % self.default_setter.status)
         lines.append("События:")
         lines.extend("  " + e for e in list(self._events)[-25:])
@@ -2504,6 +2655,8 @@ class NelyFontsPlugin(BasePlugin):
         state = ["Активен: %s" % ("да" if self.core.fs is not None else "нет"),
                  "Android SDK: %s" % sdk_int(),
                  "Paint темы: %d из %d" % (self.patcher.patched, self.patcher.total),
+                 "Кеш Telegram: %d ключей" % self.primed,
+                 "Вью обновлено: %d" % self.views.patched,
                  "Typeface.setDefault: %s" % self.default_setter.status]
         for k, v in self.hooks.status.items():
             state.append("%s: %s" % (k, v))

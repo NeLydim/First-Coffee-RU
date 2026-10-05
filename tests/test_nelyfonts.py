@@ -494,6 +494,87 @@ class SettingsTest(PluginTestBase):
                 self.assertIn(icon, valid)
 
 
+class TelegramCacheTest(unittest.TestCase):
+    """Кеш Telegram + уже показанные вью, когда хуки на regular()/bold() не срабатывают."""
+
+    def setUp(self):
+        stubs = sdk_stubs
+        stubs.FakeAU.reset()
+        self.orig_regular = stubs.FakeAU.regular()
+        self.orig_medium = stubs.FakeAU.bold()
+        self.header = stubs.FakeTextView(self.orig_medium)          # HeaderCell: bold()
+        self.cell = stubs.FakeTextView(self.orig_regular)           # TextCell: regular()
+        self.plain = stubs.FakeTextView(None)
+        self.mono = stubs.FakeTextView(stubs.FakeTypefaceClass.MONOSPACE)
+        root = stubs.FakeViewGroup(self.header, stubs.FakeViewGroup(self.cell, self.plain, self.mono))
+        stubs.FakeLaunchActivity.instance = stubs.FakeLaunchActivity(root)
+        stubs.JCLASSES.update({
+            nf.AU_CLASS: stubs.FakeAU,
+            "android.widget.TextView": stubs.FakeTextView,
+            "android.view.ViewGroup": stubs.FakeViewGroup,
+            "org.telegram.ui.LaunchActivity": stubs.FakeLaunchActivity,
+        })
+        nf.J._cache[nf.AU_CLASS] = stubs.FakeAUClass()
+        self.tmp = tempfile.mkdtemp(prefix="nelyfonts-cache-")
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.plugin = nf.NelyFontsPlugin()
+        self.plugin.on_plugin_load()
+
+    def tearDown(self):
+        self.plugin.on_plugin_unload()
+        for k in (nf.AU_CLASS, "android.widget.TextView", "android.view.ViewGroup",
+                  "org.telegram.ui.LaunchActivity"):
+            sdk_stubs.JCLASSES.pop(k, None)
+        nf.J._cache.pop(nf.AU_CLASS, None)
+        os.chdir(self.old_cwd)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_cache_primed_and_views_patched(self):
+        AU = sdk_stubs.FakeAU
+        self.assertTrue(self.plugin._import([("path", TTF)], None, "file"))
+        fs = self.plugin.core.fs
+        self.assertIs(AU.regular(), fs.roles["regular"])
+        self.assertIs(AU.bold(), fs.roles["medium"])
+        self.assertIs(AU.getTypeface("fonts/ritalic.ttf"), fs.roles["italic"])
+        self.assertIs(AU.getTypeface("fonts/rcondensedbold.ttf"), fs.roles["bold"])
+        self.assertIsNot(AU.getTypeface("fonts/rmono.ttf"), fs.roles["regular"])  # моно оставлен
+        self.assertIs(self.header.tf, fs.roles["medium"])
+        self.assertIs(self.cell.tf, fs.roles["regular"])
+        self.assertIs(self.plain.tf, fs.roles["regular"])
+        self.assertIs(self.mono.tf, sdk_stubs.FakeTypefaceClass.MONOSPACE)
+        self.assertGreaterEqual(self.plugin.primed, 7)
+        self.assertEqual(self.plugin._tree_snapshot()[:2], (3, 3))
+
+    def test_reprime_after_external_clear(self):
+        AU = sdk_stubs.FakeAU
+        self.assertTrue(self.plugin._import([("path", TTF)], None, "file"))
+        fs = self.plugin.core.fs
+        AU.clearTypefaceCache()                     # например, exteraGram «Системный шрифт»
+        nf._ClearCacheHook(self.plugin).after_hooked_method(object())
+        self.assertIs(AU.regular(), fs.roles["regular"])
+        self.assertIs(AU.bold(), fs.roles["medium"])
+
+    def test_disable_restores_originals(self):
+        AU = sdk_stubs.FakeAU
+        self.assertTrue(self.plugin._import([("path", TTF)], None, "file"))
+        self.plugin._deactivate()
+        core = self.plugin.core
+        for tf in (AU.regular(), AU.bold(), self.header.tf, self.cell.tf, self.plain.tf):
+            self.assertFalse(core.is_ours(tf), tf)
+        self.assertEqual(core.classify(self.header.tf), "medium")
+
+    def test_switching_fonts_replaces_previous(self):
+        AU = sdk_stubs.FakeAU
+        self.assertTrue(self.plugin._import([("path", TTF)], None, "file"))
+        self.assertTrue(self.plugin._import([("path", os.path.join(FIX, "variable_wght.ttf"))], None, "file"))
+        fs = self.plugin.core.fs
+        self.assertIn("variable_wght", str(fs.roles["regular"].src) + self.plugin.store.meta["slots"]["regular"]["name"])
+        self.assertIs(AU.regular(), fs.roles["regular"])
+        self.assertIs(self.cell.tf, fs.roles["regular"])
+        self.assertIs(self.header.tf, fs.roles["medium"])
+
+
 class MetadataTest(unittest.TestCase):
     def test_metadata(self):
         self.assertEqual(nf.__name__, "NelyFonts")

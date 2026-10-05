@@ -245,3 +245,141 @@ def load_plugin_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+# ---- Подделка AndroidUtilities (кеш шрифтов Telegram) и дерева вью ----------
+class FakeMap(dict):
+    def put(self, k, v):
+        self[k] = v
+
+    def remove(self, k):
+        self.pop(k, None)
+
+    def entrySet(self):
+        items = list(self.items())
+
+        class _Entry:
+            def __init__(self, k, v):
+                self._k, self._v = k, v
+
+            def getKey(self):
+                return self._k
+
+            def getValue(self):
+                return self._v
+
+        class _It:
+            def __init__(self):
+                self.i = 0
+
+            def hasNext(self):
+                return self.i < len(items)
+
+            def next(self):
+                k, v = items[self.i]
+                self.i += 1
+                return _Entry(k, v)
+
+        return types.SimpleNamespace(iterator=_It)
+
+
+class FakeAU:
+    """AndroidUtilities: getTypeface() читает кеш (как встроенный ART-ом код — без хуков)."""
+    typefaceCache = FakeMap()
+    mediumTypeface = None
+
+    @classmethod
+    def reset(cls):
+        cls.typefaceCache = FakeMap()
+        cls.mediumTypeface = None
+
+    @classmethod
+    def getTypeface(cls, path):
+        if path not in cls.typefaceCache:
+            cls.typefaceCache[path] = FakeTypeface("asset:" + path)
+        return cls.typefaceCache[path]
+
+    @classmethod
+    def regular(cls):
+        return cls.getTypeface("fonts/rregular.ttf")
+
+    @classmethod
+    def bold(cls):
+        if cls.mediumTypeface is None:
+            cls.mediumTypeface = cls.getTypeface("fonts/rmedium.ttf")
+        return cls.mediumTypeface
+
+    @classmethod
+    def clearTypefaceCache(cls):
+        cls.typefaceCache.clear()
+        cls.mediumTypeface = None
+
+
+class FakeField:
+    def __init__(self, owner, name):
+        self.owner, self.name = owner, name
+
+    def setAccessible(self, _flag):
+        pass
+
+    def get(self, _obj):
+        return getattr(self.owner, self.name)
+
+    def set(self, _obj, value):
+        setattr(self.owner, self.name, value)
+
+
+class FakeAUClass:
+    """java.lang.Class для AndroidUtilities (для reflection-доступа к полям)."""
+
+    def getDeclaredField(self, name):
+        if not hasattr(FakeAU, name):
+            raise Exception("NoSuchFieldException: " + name)
+        return FakeField(FakeAU, name)
+
+    def getDeclaredMethods(self):
+        return []
+
+
+class FakeView:
+    def getVisibility(self):
+        return 0
+
+    def getClass(self):
+        return types.SimpleNamespace(getName=lambda: type(self).__name__)
+
+
+class FakeTextView(FakeView):
+    def __init__(self, tf):
+        self.tf = tf
+
+    def getTypeface(self):
+        return self.tf
+
+    def setTypeface(self, tf):
+        self.tf = tf
+
+
+class FakeViewGroup(FakeView):
+    def __init__(self, *children):
+        self.children = list(children)
+
+    def getChildCount(self):
+        return len(self.children)
+
+    def getChildAt(self, i):
+        return self.children[i]
+
+
+class FakeLaunchActivity:
+    instance = None
+    rebuilds = 0
+
+    def __init__(self, root):
+        self.root = root
+
+    def getWindow(self):
+        return types.SimpleNamespace(getDecorView=lambda: self.root)
+
+    def rebuildAllFragments(self, _last):
+        FakeLaunchActivity.rebuilds += 1
