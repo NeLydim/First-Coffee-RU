@@ -5,7 +5,7 @@ __author__ = "@NeLydim"
 __version__ = "3.0.0"
 __min_version__ = "12.1.1"
 __app_version__ = ">=12.1.1"
-__icon__ = "Neuro424/96"
+__icon__ = "Neuro424/91"
 
 import json
 import os
